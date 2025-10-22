@@ -3,84 +3,87 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-  <title>HeyGen Viewer</title>
+  <title>HeyGen Viewer (diag)</title>
   <style>
     html,body { margin:0; padding:0; background:#0b0e11; height:100%; }
-    .wrap { display:flex; align-items:center; justify-content:center; height:100%; }
-    video { width:100%; height:auto; max-height:100vh; background:#000; border-radius:14px; }
-    .hint { position:fixed; bottom:10px; left:0; right:0; text-align:center; color:#9aa4ad; font:12px system-ui; }
+    .wrap { display:flex; align-items:center; justify-content:center; min-height:80vh; }
+    video { width:100%; height:auto; max-height:70vh; background:#000; border-radius:14px; }
+    .log { font:12px/1.45 system-ui, -apple-system, Segoe UI, Roboto, Arial; color:#e5e7eb;
+           background:#111827; border-top:1px solid #374151; padding:10px 12px; white-space:pre-wrap; }
+    .ok { color:#22c55e } .warn { color:#f59e0b } .err { color:#ef4444 }
   </style>
 </head>
 <body>
   <div class="wrap">
     <video id="v" playsinline autoplay></video>
   </div>
-  <div class="hint">Connecting to session…</div>
+  <div id="log" class="log">Connecting to session…</div>
 
   <script>
-    // --- placeholders filled by Streamlit before render ---
-    const SESSION_TOKEN = "__SESSION_TOKEN__";       // bearer token for this session (from create_token)
-    const SESSION_ID    = "__SESSION_ID__";          // session id (from streaming.new)
-    const OFFER_SDP     = "__OFFER_SDP__";           // remote offer sdp (from streaming.new)
-    const RTC_CONFIG    = JSON.parse("__RTC_CONFIG__"); // {"iceServers":[...]}  (from streaming.new)
+    // Placeholders replaced by Streamlit:
+    const SESSION_TOKEN   = "__SESSION_TOKEN__";         // from create_token
+    const SESSION_ID      = "__SESSION_ID__";            // from streaming.new
+    const OFFER_SDP_B64   = "__OFFER_SDP_B64__";         // base64-encoded SDP (from streaming.new)
+    const RTC_CONFIG      = JSON.parse("__RTC_CONFIG__");// {"iceServers":[...]}
+    const API_BASE        = "__API_BASE__";              // https://api.heygen.com/v1
 
-    // Minimal WebRTC hookup:
-    // 1) Set remote offer (from server).
-    // 2) Create local answer and POST it back to HeyGen with Bearer token.
-    // 3) Receive media tracks and play.
+    const logEl = document.getElementById("log");
+    function log(msg, cls){ if(!logEl) return; const p=document.createElement("div"); if(cls) p.className=cls; p.textContent=msg; logEl.appendChild(p); }
+    function j(v){ try{return JSON.stringify(v);}catch{return String(v)} }
 
-    const videoEl = document.getElementById("v");
-    const hintEl  = document.querySelector(".hint");
+    async function postSDP(answerSDP, useBearer=true){
+      const url = API_BASE + "/streaming.sdp";
+      const headers = { "Content-Type": "application/json", "accept": "application/json" };
+      if(useBearer){ headers["Authorization"] = "Bearer " + SESSION_TOKEN; }
+      else { headers["x-api-key"] = SESSION_TOKEN; } // fallback attempt
 
-    function say(msg){ if(hintEl) hintEl.textContent = msg; }
+      const body = { session_id: SESSION_ID, sdp: answerSDP };
+      log("POST " + url + " " + (useBearer?"(Bearer)":"(x-api-key)"));
+      const r = await fetch(url, { method:"POST", headers, body: JSON.stringify(body) });
+      const t = await r.text();
+      log("SDP status=" + r.status + " body=" + t.slice(0,240) + (t.length>240?"…":"") , r.ok?"ok":"err");
+      return r.ok;
+    }
 
     async function main(){
       try{
-        say("Preparing peer connection…");
+        const offerSDP = atob(OFFER_SDP_B64);
+        log("RTC config=" + j(RTC_CONFIG));
         const pc = new RTCPeerConnection(RTC_CONFIG || {});
         pc.addEventListener("track", (ev) => {
-          try { videoEl.srcObject = ev.streams[0]; } catch(_) {}
+          const v = document.getElementById("v");
+          if (ev.streams && ev.streams[0]) { v.srcObject = ev.streams[0]; log("Track received", "ok"); }
         });
-
-        // Some browsers need a dummy transceiver to ensure audio plays out
         pc.addTransceiver("audio", { direction: "recvonly" });
         pc.addTransceiver("video", { direction: "recvonly" });
 
-        // 1) set remote offer
-        await pc.setRemoteDescription({ type: "offer", sdp: OFFER_SDP });
+        await pc.setRemoteDescription({ type:"offer", sdp: offerSDP });
+        log("Remote offer set", "ok");
 
-        // 2) create and set local answer
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
+        log("Local answer created", "ok");
 
-        say("Sending local SDP answer…");
-        // 3) POST answer back to HeyGen using Bearer (session-scoped) token
-        const resp = await fetch("https://api.heygen.com/v1/streaming.sdp", {
-          method: "POST",
-          headers: {
-            "Authorization": "Bearer " + SESSION_TOKEN,
-            "Content-Type": "application/json",
-            "accept": "application/json",
-          },
-          body: JSON.stringify({ session_id: SESSION_ID, sdp: pc.localDescription.sdp }),
-        });
-
-        if(!resp.ok){
-          const text = await resp.text();
-          say("SDP submit failed: " + resp.status);
-          console.error("SDP error", resp.status, text);
+        // First try Authorization: Bearer <token>. If it fails, try x-api-key with the same token.
+        let ok = await postSDP(pc.localDescription.sdp, true);
+        if(!ok){
+          log("Bearer attempt failed, trying x-api-key fallback…", "warn");
+          ok = await postSDP(pc.localDescription.sdp, false);
+        }
+        if(!ok){
+          log("Failed to submit SDP to server. Check org API settings / token scope.", "err");
           return;
         }
-
-        say("Connected. If you don't hear audio, check device volume and site permissions.");
+        log("Viewer connected. If you don't see video/audio, check firewall/VPN and media permissions.", "ok");
       } catch (e){
+        log("Viewer error: " + (e && e.message ? e.message : e), "err");
         console.error(e);
-        say("Viewer error: " + (e && e.message ? e.message : e));
       }
     }
 
-    // Autoplay policies: try to ensure unmuted playback; some browsers may require a user tap.
-    videoEl.muted = false;
+    // Some iOS versions need muted first; then you can unmute via user gesture.
+    const v = document.getElementById("v");
+    v.muted = true;
     main();
   </script>
 </body>
