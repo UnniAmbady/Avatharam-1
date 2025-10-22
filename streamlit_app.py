@@ -1,278 +1,253 @@
 # streamlit_app.py
-# Mobile-first Streamlit app: HeyGen Avatar (Alessandra Casual Look) + Start/Stop mic.
-# Behavior: When mic is ON, your speech is transcribed and immediately echoed by the avatar.
-# Notes:
-# - Reads HeyGen API key from st.secrets["HeyGen"]["heygen_api_key"].
-# - (Optional) Reads OpenAI API key from st.secrets["openai"]["api_key"] if you use Whisper.
-# - Designed for iPhone/smartphone screens (single-column, big buttons, no debug panes).
-# - Minimal external controls: only Start and Stop.
+# Single-screen mobile UI. Startup sequence matches Stage-1 Ver.7:
+# 1) POST /v1/streaming.new  -> session_id, offer.sdp, ice servers
+# 2) POST /v1/streaming.create_token  (with session_id) -> token
+# 3) time.sleep(1.0)
+# 4) Render viewer.html via components.html(...) with placeholders replaced
 #
-# Dependencies (add these to requirements.txt):
-#   streamlit==1.38.0
-#   streamlit-webrtc==0.47.7
-#   requests==2.32.3
-#   pydub==0.25.1
-#   openai==1.43.0   # optional but recommended for robust STT; you can swap with your preferred STT
-#   numpy==1.26.4
-#   av==12.2.0
-#
-# If you prefer to avoid OpenAI Whisper for STT, swap the transcribe_audio_bytes() implementation
-# with another STT provider of your choice.
+# Mic Echo (optional): Start/Stop uses streamlit-webrtc. On Start, mic audio is captured
+# and transcribed (OpenAI Whisper if key present) then sent back to the SAME session to speak.
+# If you only need avatar startup (steps 1-4), you can comment out the webrtc / echo parts.
 
 import os
-import uuid
-import time
 import json
-import queue
-import base64
-import threading
+import time
+from pathlib import Path
 from typing import Optional
 
-import numpy as np
 import requests
+import numpy as np
 import streamlit as st
-from streamlit_webrtc import WebRtcMode, webrtc_streamer, AudioProcessorBase
+import streamlit.components.v1 as components
 
-# ----------------------------------
-# Config & Secrets
-# ----------------------------------
-st.set_page_config(page_title="Avatar Echo — Alessandra", page_icon="🗣️", layout="centered")
+# Optional STT libs only used if OPENAI_API_KEY is present
+try:
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
+    _HAS_WEBRTC = True
+except Exception:
+    _HAS_WEBRTC = False
 
-HEYGEN_API_KEY = st.secrets["HeyGen"]["heygen_api_key"]
-OPENAI_API_KEY = st.secrets.get("openai", {}).get("api_key")  # optional
-
-AVATAR_ID = "Alessandra_CasualLook_public"
-VOICE_ID = "0d3f35185d7c4360b9f03312e0264d59"
-
-# The HeyGen Interactive Avatar (Streaming) iframe base. This is the same viewer used in your stage-2 app.
-# If your org uses a different base URL for the viewer, update the value below.
-HEYGEN_IFRAME_BASE = "https://labs.heygen.com/streaming"  # common default; adjust if your code uses a different host
-
-# ----------------------------------
-# Simple CSS for mobile (big buttons, full-width, minimal chrome)
-# ----------------------------------
+# -------------------------------
+# Page & Mobile CSS
+# -------------------------------
+st.set_page_config(page_title="Alessandra • Echo", page_icon="🗣️", layout="centered")
 st.markdown(
     """
     <style>
-      .block-container { padding-top: 0.8rem; padding-bottom: 2rem; }
-      .stButton > button { width: 100%; height: 56px; font-size: 1.1rem; border-radius: 12px; }
-      .pill { background: #f1f5f9; padding: 6px 12px; border-radius: 999px; font-size: 0.85rem; }
-      .caption { color: #6b7280; font-size: 0.8rem; }
-      iframe { border: none; border-radius: 14px; }
+      .block-container { padding-top: 0.6rem; padding-bottom: 1.6rem; }
+      .stButton > button { width: 100%; height: 56px; font-size: 1.05rem; border-radius: 12px; }
+      .caption { color:#64748b; font-size:0.8rem; }
+      iframe { border:none; border-radius:14px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ----------------------------------
-# Utilities
-# ----------------------------------
+# -------------------------------
+# Secrets helpers (supports [HeyGen] or [heygen], env fallback)
+# -------------------------------
+def get_heygen_key() -> Optional[str]:
+    s = st.secrets
+    for sec, k in [("HeyGen", "heygen_api_key"), ("heygen", "heygen_api_key")]:
+        try:
+            return s[sec][k]
+        except Exception:
+            pass
+    return os.getenv("HEYGEN_API_KEY")
 
-def _ok(resp: requests.Response) -> bool:
-    return 200 <= resp.status_code < 300
+HEYGEN_API_KEY = get_heygen_key()
+if not HEYGEN_API_KEY:
+    st.error(
+        "Missing HeyGen API key. Add to `.streamlit/secrets.toml`:\n\n"
+        "[HeyGen]\nheygen_api_key = \"NzBiOTA…==\""
+    )
+    st.stop()
 
-@st.cache_data(show_spinner=False)
-def create_heygen_token(avatar_id: str, voice_id: str) -> dict:
-    """Create a short-lived HeyGen streaming token and session.
-    Returns dict with fields: {"token": str, "session_id": str, "realtime_endpoint": str}
-    """
-    url = "https://api.heygen.com/v1/streaming.create_token"
-    payload = {"voice_id": voice_id, "avatar_id": avatar_id}
-    headers = {"x-api-key": HEYGEN_API_KEY, "Content-Type": "application/json"}
-    resp = requests.post(url, headers=headers, json=payload, timeout=20)
-    if not _ok(resp):
-        raise RuntimeError(f"HeyGen token error {resp.status_code}: {resp.text}")
-    data = resp.json()
-    # Expected shape: {"data": {"token": "...", "session_id": "...", "realtime_endpoint": "wss://..."}}
-    return data.get("data", data)
+OPENAI_API_KEY = (st.secrets.get("openai", {}) or {}).get("api_key") or os.getenv("OPENAI_API_KEY")
 
-# Optional: If your stage-2 code posts text to the same session via REST, expose a helper.
-# Confirm the exact endpoint your code uses; the line below follows the common pattern.
+AVATAR_ID = "Alessandra_CasualLook_public"
+VOICE_ID  = "0d3f35185d7c4360b9f03312e0264d59"
 
-def speak_text_via_session(session_id: str, text: str) -> None:
-    """Send a text input to the existing HeyGen realtime session so the avatar speaks it.
-    Adjust the endpoint/path if your stage-2 code uses a slightly different route.
-    """
-    url = f"https://api.heygen.com/v1/streaming/session/{session_id}/speak"
-    headers = {"x-api-key": HEYGEN_API_KEY, "Content-Type": "application/json"}
-    payload = {"text": text}
-    resp = requests.post(url, headers=headers, json=payload, timeout=20)
-    if not _ok(resp):
-        st.toast("Avatar speak call failed — check endpoint path in code.")
+BASE = "https://api.heygen.com/v1"
+API_STREAM_NEW   = f"{BASE}/streaming.new"
+API_CREATE_TOKEN = f"{BASE}/streaming.create_token"
 
-# ----------------------------------
-# Transcription (OpenAI Whisper, optional but recommended)
-# ----------------------------------
+HEADERS = {
+    "x-api-key": HEYGEN_API_KEY,
+    "accept": "application/json",
+    "Content-Type": "application/json",
+}
 
-def transcribe_audio_bytes(raw_pcm: bytes, sample_rate: int) -> Optional[str]:
-    """Send audio to Whisper for transcription and return text. PCM 16-bit mono expected.
-    Returns None on failure or empty result.
-    """
-    if not OPENAI_API_KEY:
+# -------------------------------
+# Step 1: create session (new)
+# -------------------------------
+def new_session(avatar_id: str, voice_id: Optional[str] = None):
+    payload = {"avatar_id": avatar_id}
+    if voice_id:
+        payload["voice_id"] = voice_id
+
+    r = requests.post(API_STREAM_NEW, headers=HEADERS, json=payload, timeout=45)
+    r.raise_for_status()
+    d = r.json()["data"]
+
+    session_id = d["session_id"]
+    # some tenants return {"offer":{"sdp":...}}, others {"sdp":{"sdp":...}}
+    offer_sdp = (d.get("offer") or d.get("sdp") or {}).get("sdp")
+    if not offer_sdp:
+        raise RuntimeError("Missing offer.sdp in streaming.new response")
+
+    ice2 = d.get("ice_servers2") or []
+    ice1 = d.get("ice_servers") or []
+    rtc_config = {"iceServers": (ice2 or ice1 or [{"urls": ["stun:stun.l.google.com:19302"]}])}
+    return session_id, offer_sdp, rtc_config
+
+# -------------------------------
+# Step 2: create token for that session
+# -------------------------------
+def create_session_token(session_id: str) -> str:
+    r = requests.post(API_CREATE_TOKEN, headers=HEADERS, json={"session_id": session_id}, timeout=45)
+    r.raise_for_status()
+    dd = r.json()["data"]
+    return dd.get("token") or dd.get("access_token")
+
+# -------------------------------
+# Speak via REST (same session). Endpoint names can vary by tenant;
+# we try two common paths; no hard fail if both 404.
+# -------------------------------
+def speak_text(session_id: str, text: str):
+    for path in (
+        f"{BASE}/streaming/session/{session_id}/speak",
+        f"{BASE}/streaming.input",  # legacy multi-session input
+    ):
+        try:
+            payload = {"text": text, "session_id": session_id}  # harmless extra field for first path
+            r = requests.post(path, headers=HEADERS, json=payload, timeout=20)
+            if 200 <= r.status_code < 300:
+                return True
+        except Exception:
+            pass
+    st.toast("Speak endpoint not accepted; check your org path.")
+    return False
+
+# -------------------------------
+# Render viewer.html (Step 4)
+# -------------------------------
+def render_viewer_html(token: str, session_id: str, offer_sdp: str, rtc_config: dict, height: int = 600):
+    viewer_path = Path(__file__).parent / "viewer.html"
+    if not viewer_path.exists():
+        st.error("viewer.html not found next to streamlit_app.py. Please add it from Stage-1.")
+        st.stop()
+
+    raw = viewer_path.read_text(encoding="utf-8")
+    # Keep SDP newlines unescaped; we inject without quotes by trimming json dumps quoting.
+    sdp_raw = json.dumps(offer_sdp)[1:-1]
+    html = (
+        raw.replace("__SESSION_TOKEN__", token)
+           .replace("__SESSION_ID__", session_id)
+           .replace("__AVATAR_NAME__", "Alessandra Casual Look")
+           .replace("__OFFER_SDP__", sdp_raw)
+           .replace("__RTC_CONFIG__", json.dumps(rtc_config))
+    )
+    components.html(html, height=height, scrolling=False)
+
+# -------------------------------
+# Optional: Mic → STT → Speak back (Echo)
+# -------------------------------
+class _MicProc(AudioProcessorBase):
+    def __init__(self):
+        self.buf = b""
+        self.sample_rate = 16000
+
+    def recv_audio(self, frame):
+        pcm16 = frame.to_ndarray(format="s16")
+        if pcm16.ndim == 2 and pcm16.shape[0] > 1:
+            pcm16 = pcm16[0:1, :]
+        pcm16 = np.squeeze(pcm16)
+        in_rate = frame.sample_rate
+        if in_rate != self.sample_rate:
+            # quick linear resample
+            dur = pcm16.shape[0] / in_rate
+            new_len = int(dur * self.sample_rate)
+            pcm16 = np.interp(
+                np.linspace(0, pcm16.shape[0], new_len, endpoint=False),
+                np.arange(pcm16.shape[0]),
+                pcm16.astype(np.float32),
+            ).astype(np.int16)
+        self.buf += pcm16.tobytes()
+        return frame
+
+def _transcribe(pcm: bytes, rate: int) -> Optional[str]:
+    if not OPENAI_API_KEY or not pcm:
         return None
     try:
         from openai import OpenAI
-        import tempfile
-        import wave
-
+        import tempfile, wave
         client = OpenAI(api_key=OPENAI_API_KEY)
-        # Write WAV (16-bit PCM mono)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            wav_path = tmp.name
-        with wave.open(wav_path, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(sample_rate)
-            w.writeframes(raw_pcm)
-        with open(wav_path, "rb") as f:
-            tr = client.audio.transcriptions.create(model="whisper-1", file=f)
-        text = tr.text.strip() if hasattr(tr, "text") else None
-        return text or None
+            path = tmp.name
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(pcm)
+        with open(path, "rb") as f:
+            resp = client.audio.transcriptions.create(model="whisper-1", file=f)
+        text = getattr(resp, "text", "") or ""
+        return text.strip() or None
     except Exception as e:
         st.toast(f"STT error: {e}")
         return None
 
-# ----------------------------------
-# Audio pipeline (WebRTC → PCM buffer → transcription → avatar speak)
-# ----------------------------------
+# -------------------------------
+# UI
+# -------------------------------
+st.markdown("### Alessandra • Echo mode")
+with st.spinner("Starting avatar…"):
+    # Step 1
+    session_id, offer_sdp, rtc_config = new_session(AVATAR_ID, VOICE_ID)
+    # Step 2
+    token = create_session_token(session_id)
+    # Step 3 (tiny but important)
+    time.sleep(1.0)
 
-class MicAudioProcessor(AudioProcessorBase):
-    def __init__(self) -> None:
-        self._last_ts = time.time()
-        self._pcm_queue: "queue.Queue[bytes]" = queue.Queue()
-        self.sample_rate = 16000  # we will resample to 16 kHz mono if needed
+# Step 4
+render_viewer_html(token, session_id, offer_sdp, rtc_config, height=600)
 
-    def recv_audio(self, frame):
-        # frame: av.AudioFrame
-        # Convert to 16 kHz mono, 16-bit PCM
-        pcm16 = frame.to_ndarray(format="s16")
-        # If stereo, take first channel
-        if pcm16.ndim == 2 and pcm16.shape[0] > 1:
-            pcm16 = pcm16[0:1, :]
-        pcm16 = np.squeeze(pcm16)
-        # Resample if needed
-        in_rate = frame.sample_rate
-        if in_rate != self.sample_rate:
-            # Simple linear resample; for short chunks it's okay.
-            duration = pcm16.shape[0] / in_rate
-            new_length = int(duration * self.sample_rate)
-            pcm16 = np.interp(
-                np.linspace(0, pcm16.shape[0], new_length, endpoint=False),
-                np.arange(pcm16.shape[0]),
-                pcm16.astype(np.float32),
-            ).astype(np.int16)
-        self._pcm_queue.put(pcm16.tobytes())
-        return frame
-
-    def read_all(self) -> bytes:
-        chunks = []
-        try:
-            while True:
-                chunks.append(self._pcm_queue.get_nowait())
-        except queue.Empty:
-            pass
-        return b"".join(chunks)
-
-# Background worker that periodically grabs audio, transcribes, and sends to avatar
-
-def start_worker(stop_event: threading.Event, session_id: str, proc: MicAudioProcessor, interval_sec: float = 1.2):
-    while not stop_event.is_set():
-        time.sleep(interval_sec)
-        raw = proc.read_all()
-        if not raw:
-            continue
-        text = transcribe_audio_bytes(raw, sample_rate=proc.sample_rate)
-        if text:
-            speak_text_via_session(session_id, text)
-
-# ----------------------------------
-# UI — single column, mobile-first
-# ----------------------------------
-
-st.markdown("<div class='pill'>Alessandra • Echo mode</div>", unsafe_allow_html=True)
-
-# 1) Create a HeyGen session & token (no button presses; auto on load)
-with st.spinner("Preparing avatar…"):
-    token_data = create_heygen_token(AVATAR_ID, VOICE_ID)
-    session_id = token_data.get("session_id")
-    token = token_data.get("token")
-
-# 2) Render the avatar viewer (iframe). No extra controls.
-#    The viewer URL format typically accepts token via query string.
-iframe_src = f"{HEYGEN_IFRAME_BASE}?token={token}"
-st.components.v1.iframe(iframe_src, height=420)
-
-# 3) Mic controls (Start/Stop)
+# Controls (optional Echo)
 if "webrtc_ctx" not in st.session_state:
     st.session_state.webrtc_ctx = None
-if "worker_thread" not in st.session_state:
-    st.session_state.worker_thread = None
-if "stop_event" not in st.session_state:
-    st.session_state.stop_event = threading.Event()
-if "audio_proc" not in st.session_state:
-    st.session_state.audio_proc = MicAudioProcessor()
+if "mic_proc" not in st.session_state:
+    st.session_state.mic_proc = _MicProc()
 
 col1, col2 = st.columns(2, gap="small")
-
 with col1:
     start_clicked = st.button("▶️  Start", type="primary")
 with col2:
     stop_clicked = st.button("⏹️  Stop")
 
-# Start
-if start_clicked:
-    # (Re)create stop/event flags
-    if st.session_state.worker_thread and st.session_state.worker_thread.is_alive():
-        st.session_state.stop_event.set()
-        st.session_state.worker_thread.join(timeout=1.0)
-    st.session_state.stop_event = threading.Event()
-
-    # Launch WebRTC (audio only)
+if start_clicked and _HAS_WEBRTC:
     st.session_state.webrtc_ctx = webrtc_streamer(
-        key=f"mic-{uuid.uuid4()}",
+        key="mic-only",
         mode=WebRtcMode.SENDONLY,
-        audio_processor_factory=lambda: st.session_state.audio_proc,
+        audio_processor_factory=lambda: st.session_state.mic_proc,
         media_stream_constraints={"audio": True, "video": False},
         async_processing=False,
     )
+    st.toast("Mic started. Speak to echo through the avatar.")
 
-    # Background worker for STT → avatar speak
-    st.session_state.worker_thread = threading.Thread(
-        target=start_worker,
-        args=(st.session_state.stop_event, session_id, st.session_state.audio_proc, 1.2),
-        daemon=True,
-    )
-    st.session_state.worker_thread.start()
-    st.toast("Mic started. Say something — Alessandra will echo it.")
-
-# Stop
 if stop_clicked:
-    try:
-        if st.session_state.stop_event:
-            st.session_state.stop_event.set()
-        if st.session_state.worker_thread and st.session_state.worker_thread.is_alive():
-            st.session_state.worker_thread.join(timeout=1.0)
-        st.session_state.worker_thread = None
-        st.toast("Mic stopped.")
-    finally:
-        # Close WebRTC
-        if st.session_state.get("webrtc_ctx") is not None:
-            st.session_state.webrtc_ctx.destroy()
-            st.session_state.webrtc_ctx = None
+    # Proper shutdown (fixes AttributeError: no .destroy())
+    ctx = st.session_state.get("webrtc_ctx")
+    if ctx and getattr(ctx, "state", None) and ctx.state.playing:
+        ctx.stop()
+    st.session_state.webrtc_ctx = None
 
-# Footnote for small screens
-st.markdown(
-    "<div class='caption'>Tip: For best iPhone results, open in Safari and allow microphone access.</div>",
-    unsafe_allow_html=True,
-)
-
-# ----------------------------------
-# Implementation notes (read me)
-# ----------------------------------
-# 1) The speak_text_via_session() endpoint path may vary depending on your current stage-2 integration.
-#    If your existing code uses a different route (e.g., /v1/streaming.input, /v1/realtime/sessions/{id}/input, etc.),
-#    adjust that function accordingly. The rest of the app remains the same.
-# 2) If your Alessandra viewer expects additional query params (pose, voice_id, etc.),
-#    append them to iframe_src. Token alone is often sufficient once generated with the desired avatar+voice.
-# 3) If you prefer a push-to-talk UX on mobile, replace Start with a toggle or hold-to-talk using a small custom component.
-# 4) If you want to remove any potential Streamlit status messages, set server.headless = true and client.showErrorDetails = false in config.
+# Echo loop trigger (simple: every click of 'Start' we try transcribing what has accumulated so far)
+# For continuous echo you may set a timer/interval in JS or run a small loop with st.autorefresh.
+if start_clicked and OPENAI_API_KEY:
+    text = _transcribe(st.session_state.mic_proc.buf, st.session_state.mic_proc.sample_rate)
+    st.session_state.mic_proc.buf = b""
+    if text:
+        speak_text(session_id, text)
+        st.caption(f"You said: “{text}” → echoed.")
+elif start_clicked and not OPENAI_API_KEY:
+    st.caption("Tip: add [openai].api_key in secrets to enable voice echo.")
+    
+st.markdown("<div class='caption'>Open in Safari/Chrome on iPhone. Allow microphone access.</div>", unsafe_allow_html=True)
