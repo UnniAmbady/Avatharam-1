@@ -1,8 +1,4 @@
-# streamlit_app.py — Stable + verbose diagnostics
-# - Prevents repeated session creation (Streamlit re-runs)
-# - Adds detailed logs to UI + server
-# - Keeps Stage-1 order: new -> create_token -> sleep(1s) -> viewer
-
+# streamlit_app.py — Hardened guard + early diagnostics
 import os, json, time, base64
 from pathlib import Path
 from typing import Optional
@@ -18,10 +14,10 @@ try:
 except Exception:
     _HAS_WEBRTC = False
 
-st.set_page_config(page_title="Alessandra • Echo (diag)", page_icon="🗣️", layout="centered")
+st.set_page_config(page_title="Alessandra • Echo (diag2)", page_icon="🗣️", layout="centered")
 st.markdown("""
 <style>
-  .block-container { padding-top: .4rem; padding-bottom: 1.2rem; }
+  .block-container { padding-top:.4rem; padding-bottom:1.2rem; }
   .stButton > button { width:100%; height:56px; font-size:1.05rem; border-radius:12px; }
   .caption { color:#64748b; font-size:.8rem; }
   iframe { border:none; border-radius:14px; }
@@ -30,12 +26,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------------------
-# Secrets helpers
-# ---------------------------
+# ----- Secrets -----
 def get_heygen_key() -> Optional[str]:
     s = st.secrets
-    for sec, key in [("HeyGen", "heygen_api_key"), ("heygen", "heygen_api_key")]:
+    for sec, key in [("HeyGen","heygen_api_key"),("heygen","heygen_api_key")]:
         try: return s[sec][key]
         except Exception: pass
     return os.getenv("HEYGEN_API_KEY")
@@ -53,23 +47,17 @@ VOICE_ID  = "0d3f35185d7c4360b9f03312e0264d59"
 BASE = "https://api.heygen.com/v1"
 API_STREAM_NEW   = f"{BASE}/streaming.new"
 API_CREATE_TOKEN = f"{BASE}/streaming.create_token"
+HEADERS = {"x-api-key": HEYGEN_API_KEY, "accept":"application/json", "Content-Type":"application/json"}
 
-HEADERS = {"x-api-key": HEYGEN_API_KEY, "accept": "application/json", "Content-Type": "application/json"}
-
-# ---------------------------
-# Diagnostics toggle
-# ---------------------------
+# ----- Diagnostics -----
 with st.expander("Diagnostics"):
     VERBOSE = st.checkbox("Verbose logs", value=True)
-    st.caption("If it stalls, copy both UI and server logs.")
 
 def log(msg: str):
     if VERBOSE: st.write("▪️", msg)
     print(msg, flush=True)
 
-# ---------------------------
-# API helpers
-# ---------------------------
+# ----- API helpers -----
 def new_session(avatar_id: str, voice_id: Optional[str] = None):
     payload = {"avatar_id": avatar_id}
     if voice_id: payload["voice_id"] = voice_id
@@ -80,14 +68,14 @@ def new_session(avatar_id: str, voice_id: Optional[str] = None):
         log(f"[1] body={r.text}")
         r.raise_for_status()
     d = r.json().get("data", {})
-    session_id = d.get("session_id")
-    offer_sdp  = (d.get("offer") or d.get("sdp") or {}).get("sdp")
+    sid = d.get("session_id")
+    offer_sdp = (d.get("offer") or d.get("sdp") or {}).get("sdp")
     ice2 = d.get("ice_servers2") or []
     ice1 = d.get("ice_servers") or []
     rtc_config = {"iceServers": (ice2 or ice1 or [{"urls": ["stun:stun.l.google.com:19302"]}])}
-    if not session_id or not offer_sdp:
-        raise RuntimeError("Missing session_id or offer.sdp in streaming.new response")
-    return session_id, offer_sdp, rtc_config
+    if not sid or not offer_sdp:
+        raise RuntimeError("Missing session_id or offer.sdp")
+    return sid, offer_sdp, rtc_config
 
 def create_session_token(session_id: str) -> str:
     log(f"[2] POST {API_CREATE_TOKEN}")
@@ -96,75 +84,59 @@ def create_session_token(session_id: str) -> str:
     if not r.ok:
         log(f"[2] body={r.text}")
         r.raise_for_status()
-    dd = r.json().get("data", {})
-    token = dd.get("token") or dd.get("access_token")
-    if not token:
-        raise RuntimeError("No token/access_token returned by streaming.create_token")
-    return token
+    data = r.json().get("data", {})
+    tok = data.get("token") or data.get("access_token")
+    if not tok:
+        raise RuntimeError("No token/access_token in response")
+    return tok
 
-# ---------------------------
-# One-time session guard
-# ---------------------------
-if "session_ready" not in st.session_state:
-    st.session_state.session_ready = False
-if "session_id" not in st.session_state:
-    st.session_state.session_id = None
-if "offer_sdp" not in st.session_state:
-    st.session_state.offer_sdp = None
-if "rtc_config" not in st.session_state:
-    st.session_state.rtc_config = None
-if "HG_TOKEN" not in st.session_state:
-    st.session_state.HG_TOKEN = None
+# ----- One-time session guard (robust) -----
+if "state" not in st.session_state:
+    st.session_state.state = {
+        "ready": False, "session_id": None, "offer_sdp": None, "rtc_config": None, "token": None
+    }
 
-if not st.session_state.session_ready:
+S = st.session_state.state
+if not S["ready"]:
     with st.spinner("Starting avatar…"):
         sid, sdp, rtc = new_session(AVATAR_ID, VOICE_ID)
         tok = create_session_token(sid)
-        st.session_state.session_id = sid
-        st.session_state.offer_sdp  = sdp
-        st.session_state.rtc_config = rtc
-        st.session_state.HG_TOKEN   = tok
+        # mark READY **before** the sleep to avoid race on reruns
+        S.update({"ready": True, "session_id": sid, "offer_sdp": sdp, "rtc_config": rtc, "token": tok})
         log(f"[info] session_id={sid}")
         log("[3] sleeping 1.0s before viewer")
         time.sleep(1.0)
-        st.session_state.session_ready = True
 
-# ---------------------------
-# Render viewer (base64 SDP to avoid escapes)
-# ---------------------------
-def render_viewer_html(token: str, session_id: str, offer_sdp: str, rtc_config: dict, height: int = 600):
+# ----- Render viewer (no JSON.parse pitfalls) -----
+def render_viewer_html(token: str, session_id: str, offer_sdp: str, rtc_config: dict):
     viewer_path = Path(__file__).parent / "viewer.html"
     if not viewer_path.exists():
         st.error("viewer.html not found next to streamlit_app.py.")
         st.stop()
+
     sdp_b64 = base64.b64encode(offer_sdp.encode("utf-8")).decode("ascii")
+    # inject RTC_CONFIG as a literal, not as a quoted string
+    rtc_literal = json.dumps(rtc_config)
+
     raw = viewer_path.read_text(encoding="utf-8")
     html = (raw
         .replace("__SESSION_TOKEN__", token)
         .replace("__SESSION_ID__", session_id)
         .replace("__AVATAR_NAME__", "Alessandra Casual Look")
         .replace("__OFFER_SDP_B64__", sdp_b64)
-        .replace("__RTC_CONFIG__", json.dumps(rtc_config))
+        .replace("__RTC_CONFIG_LITERAL__", rtc_literal)
         .replace("__API_BASE__", BASE)
     )
     components.html(html, height=600, scrolling=False)
 
-render_viewer_html(
-    st.session_state.HG_TOKEN,
-    st.session_state.session_id,
-    st.session_state.offer_sdp,
-    st.session_state.rtc_config,
-    height=600,
-)
+render_viewer_html(S["token"], S["session_id"], S["offer_sdp"], S["rtc_config"])
 
-# ---------------------------
-# Optional: mic echo
-# ---------------------------
+# ----- Optional mic echo kept unchanged -----
 class _MicProc(AudioProcessorBase):
     def __init__(self): self.buf=b""; self.sample_rate=16000
     def recv_audio(self, frame):
         pcm16 = frame.to_ndarray(format="s16")
-        if pcm16.ndim==2 and pcm16.shape[0] > 1: pcm16=pcm16[0:1,:]
+        if pcm16.ndim==2 and pcm16.shape[0]>1: pcm16=pcm16[0:1,:]
         pcm16 = np.squeeze(pcm16)
         in_rate = frame.sample_rate
         if in_rate != self.sample_rate:
@@ -176,21 +148,6 @@ class _MicProc(AudioProcessorBase):
         self.buf += pcm16.tobytes()
         return frame
 
-def speak_text(session_id: str, text: str):
-    # Try both common endpoints; log both results.
-    url1 = f"{BASE}/streaming/session/{session_id}/speak"
-    hdr1 = {"Authorization": f"Bearer {st.session_state.get('HG_TOKEN','')}",
-            "accept": "application/json", "Content-Type": "application/json"}
-    r1 = requests.post(url1, headers=hdr1, json={"text": text, "session_id": session_id}, timeout=20)
-    log(f"[speak] {url1} -> {r1.status_code} {r1.text[:180]}")
-    if r1.ok: return True
-
-    url2 = f"{BASE}/streaming.input"
-    hdr2 = {"x-api-key": HEYGEN_API_KEY, "accept": "application/json", "Content-Type": "application/json"}
-    r2 = requests.post(url2, headers=hdr2, json={"text": text, "session_id": session_id}, timeout=20)
-    log(f"[speak] {url2} -> {r2.status_code} {r2.text[:180]}")
-    return r2.ok
-
 if "webrtc_ctx" not in st.session_state: st.session_state.webrtc_ctx = None
 if "mic_proc" not in st.session_state:   st.session_state.mic_proc = None
 
@@ -201,8 +158,7 @@ with col2:
     stop_clicked  = st.button("⏹️  Stop")
 
 if start_clicked and _HAS_WEBRTC:
-    if st.session_state.mic_proc is None:
-        st.session_state.mic_proc = _MicProc()
+    if st.session_state.mic_proc is None: st.session_state.mic_proc = _MicProc()
     st.session_state.webrtc_ctx = webrtc_streamer(
         key="mic-only",
         mode=WebRtcMode.SENDONLY,
