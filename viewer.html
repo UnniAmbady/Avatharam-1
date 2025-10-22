@@ -1,18 +1,20 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-<title>HeyGen Viewer (diag)</title>
-<style>
-  html,body { margin:0; padding:0; background:#0b0e11; height:100%; }
-  .wrap { display:flex; align-items:center; justify-content:center; min-height:80vh; }
-  video { width:100%; height:auto; max-height:70vh; background:#000; border-radius:14px; }
-  .log { font:12px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial; color:#e5e7eb;
-         background:#111827; border-top:1px solid #374151; padding:10px 12px; white-space:pre-wrap; }
-  .ok { color:#22c55e } .warn { color:#f59e0b } .err { color:#ef4444 }
-  .bar { position:sticky; top:0; background:#0f172a; padding:6px 10px; border-bottom:1px solid #334155; font:12px; color:#cbd5e1; }
-</style>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>HeyGen Viewer (diag2)</title>
+  <style>
+    html,body { margin:0; padding:0; background:#0b0e11; height:100%; }
+    .wrap { display:flex; align-items:center; justify-content:center; min-height:80vh; }
+    video { width:100%; height:auto; max-height:70vh; background:#000; border-radius:14px; }
+    .log { font:12px/1.45 system-ui, -apple-system, Segoe UI, Roboto, Arial; color:#e5e7eb;
+           background:#111827; border-top:1px solid #374151; padding:10px 12px; white-space:pre-wrap; }
+    .ok { color:#22c55e } .warn { color:#f59e0b } .err { color:#ef4444 }
+    .bar { position:sticky; top:0; background:#0f172a; padding:6px 10px; border-bottom:1px solid #334155; font:12px; color:#cbd5e1; }
+  </style>
 </head>
 <body>
   <div class="bar">Connecting to session…</div>
@@ -20,17 +22,23 @@
   <div id="log" class="log">Boot.</div>
 
 <script>
-  // Placeholders replaced by Streamlit:
-  const SESSION_TOKEN = "__SESSION_TOKEN__";
-  const SESSION_ID    = "__SESSION_ID__";
-  const OFFER_SDP_B64 = "__OFFER_SDP_B64__";
-  const RTC_CONFIG    = JSON.parse("__RTC_CONFIG__");
-  const API_BASE      = "__API_BASE__";
-
-  const bar = document.querySelector(".bar");
+  // ---- Ultra-early error taps
   const logEl = document.getElementById("log");
-  function setBar(t){ if(bar) bar.textContent = t; }
   function log(t, cls){ const d=document.createElement("div"); if(cls) d.className=cls; d.textContent=t; logEl.appendChild(d); console.log(t); }
+  function setBar(t){ const b=document.querySelector(".bar"); if(b) b.textContent=t; }
+  window.onerror = function(msg, src, line, col, err){ log("onerror: " + msg + " @ " + src + ":" + line + ":" + col + (err?(" | " + err.stack):""), "err"); }
+  window.addEventListener("unhandledrejection", ev => { log("unhandledrejection: " + (ev.reason && ev.reason.stack ? ev.reason.stack : ev.reason), "err"); });
+
+  log("JS loaded", "ok");
+
+  // ---- Placeholders from Python
+  const SESSION_TOKEN   = "__SESSION_TOKEN__";
+  const SESSION_ID      = "__SESSION_ID__";
+  const OFFER_SDP_B64   = "__OFFER_SDP_B64__";
+  const RTC_CONFIG      = __RTC_CONFIG_LITERAL__;  // inserted as raw JSON literal
+  const API_BASE        = "__API_BASE__";
+
+  log("placeholders parsed", "ok");
 
   async function postSDP(answerSDP, useBearer=true){
     const url = API_BASE + "/streaming.sdp";
@@ -54,7 +62,6 @@
       pc.addEventListener("connectionstatechange", ()=>log("pc.connectionState="+pc.connectionState));
       pc.addEventListener("iceconnectionstatechange", ()=>log("pc.iceConnectionState="+pc.iceConnectionState));
       pc.addEventListener("signalingstatechange", ()=>log("pc.signalingState="+pc.signalingState));
-
       pc.addEventListener("track", (ev) => {
         const v = document.getElementById("v");
         if (ev.streams && ev.streams[0]) { v.srcObject = ev.streams[0]; log("Track received", "ok"); setBar("Connected."); }
@@ -64,23 +71,17 @@
       pc.addTransceiver("video", { direction: "recvonly" });
 
       await pc.setRemoteDescription({ type:"offer", sdp: offerSDP });
-      log("Remote offer set", "ok");
-      setBar("Creating local answer…");
+      log("Remote offer set", "ok"); setBar("Creating local answer…");
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      log("Local answer created", "ok");
-      setBar("Submitting SDP to server…");
+      log("Local answer created", "ok"); setBar("Submitting SDP to server…");
 
       let ok = await postSDP(pc.localDescription.sdp, true);
-      if(!ok){
-        log("Bearer attempt failed, trying x-api-key fallback…", "warn");
-        ok = await postSDP(pc.localDescription.sdp, false);
-      }
+      if(!ok){ log("Bearer attempt failed, trying x-api-key fallback…", "warn"); ok = await postSDP(pc.localDescription.sdp, false); }
       if(!ok){ setBar("SDP submit failed. See logs below."); return; }
 
       setBar("Waiting for media…");
-      // If ICE never connects, you’ll see it in the log via iceConnectionState changes.
 
     } catch (e){
       log("Viewer error: " + (e && e.message ? e.message : e), "err");
@@ -88,9 +89,8 @@
     }
   }
 
-  // iOS often needs muted autoplay; user can unmute after media flows
   const v = document.getElementById("v");
-  v.muted = true;
+  v.muted = true; // iOS-safe autoplay
   main();
 </script>
 </body>
