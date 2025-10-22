@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>HeyGen Viewer</title>
+  <style>
+    html,body { margin:0; padding:0; background:#0b0e11; height:100%; }
+    .wrap { display:flex; align-items:center; justify-content:center; height:100%; }
+    video { width:100%; height:auto; max-height:100vh; background:#000; border-radius:14px; }
+    .hint { position:fixed; bottom:10px; left:0; right:0; text-align:center; color:#9aa4ad; font:12px system-ui; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <video id="v" playsinline autoplay></video>
+  </div>
+  <div class="hint">Connecting to session…</div>
+
+  <script>
+    // --- placeholders filled by Streamlit before render ---
+    const SESSION_TOKEN = "__SESSION_TOKEN__";       // bearer token for this session (from create_token)
+    const SESSION_ID    = "__SESSION_ID__";          // session id (from streaming.new)
+    const OFFER_SDP     = "__OFFER_SDP__";           // remote offer sdp (from streaming.new)
+    const RTC_CONFIG    = JSON.parse("__RTC_CONFIG__"); // {"iceServers":[...]}  (from streaming.new)
+
+    // Minimal WebRTC hookup:
+    // 1) Set remote offer (from server).
+    // 2) Create local answer and POST it back to HeyGen with Bearer token.
+    // 3) Receive media tracks and play.
+
+    const videoEl = document.getElementById("v");
+    const hintEl  = document.querySelector(".hint");
+
+    function say(msg){ if(hintEl) hintEl.textContent = msg; }
+
+    async function main(){
+      try{
+        say("Preparing peer connection…");
+        const pc = new RTCPeerConnection(RTC_CONFIG || {});
+        pc.addEventListener("track", (ev) => {
+          try { videoEl.srcObject = ev.streams[0]; } catch(_) {}
+        });
+
+        // Some browsers need a dummy transceiver to ensure audio plays out
+        pc.addTransceiver("audio", { direction: "recvonly" });
+        pc.addTransceiver("video", { direction: "recvonly" });
+
+        // 1) set remote offer
+        await pc.setRemoteDescription({ type: "offer", sdp: OFFER_SDP });
+
+        // 2) create and set local answer
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        say("Sending local SDP answer…");
+        // 3) POST answer back to HeyGen using Bearer (session-scoped) token
+        const resp = await fetch("https://api.heygen.com/v1/streaming.sdp", {
+          method: "POST",
+          headers: {
+            "Authorization": "Bearer " + SESSION_TOKEN,
+            "Content-Type": "application/json",
+            "accept": "application/json",
+          },
+          body: JSON.stringify({ session_id: SESSION_ID, sdp: pc.localDescription.sdp }),
+        });
+
+        if(!resp.ok){
+          const text = await resp.text();
+          say("SDP submit failed: " + resp.status);
+          console.error("SDP error", resp.status, text);
+          return;
+        }
+
+        say("Connected. If you don't hear audio, check device volume and site permissions.");
+      } catch (e){
+        console.error(e);
+        say("Viewer error: " + (e && e.message ? e.message : e));
+      }
+    }
+
+    // Autoplay policies: try to ensure unmuted playback; some browsers may require a user tap.
+    videoEl.muted = false;
+    main();
+  </script>
+</body>
+</html>
