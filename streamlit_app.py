@@ -1,10 +1,10 @@
-# ver-11.1
+# ver-11.2
 # HeyGen avatar + mic_recorder + (optional) faster-whisper
-# Changes vs ver-11:
-# - Viewer embed height reduced ~50% (fits on one screen).
-# - Mic recorder with audio playback shown below buttons and above transcript box.
-# - Keeps transcript in st.session_state.last_text.
-# - Adds Test-2 (send transcript to avatar). Removes Clear/Reset.
+# Fixes:
+# - Viewer video no longer cropped (paired viewer.html uses object-fit: contain).
+# - Mic recorder uses a *stable key* and shows audio player & transcript reliably.
+# - Clear instruction label & robust diagnostics.
+# - Test-2 sends current transcript to avatar.
 
 import json
 import os
@@ -18,7 +18,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
-# --- Optional STT backends ---
+# --- Optional STT backend ---
 try:
     from faster_whisper import WhisperModel  # local inference
     _HAS_FWHISPER = True
@@ -42,7 +42,7 @@ st.markdown("""
   .block-container { padding-top:.6rem; padding-bottom:1rem; }
   iframe { border:none; border-radius:16px; }
   .rowbtn .stButton>button { height:40px; font-size:.95rem; border-radius:12px; }
-  .hint { font-size:.9rem; opacity:.7; }
+  .hint { font-size:.9rem; opacity:.75; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -80,7 +80,8 @@ ss = st.session_state
 ss.setdefault("debug_buf", [])
 def debug(msg: str):
     ss.debug_buf.append(str(msg))
-    if len(ss.debug_buf) > 1000: ss.debug_buf[:] = ss.debug_buf[-1000:]
+    if len(ss.debug_buf) > 1000:
+        ss.debug_buf[:] = ss.debug_buf[-1000:]
 
 # ------------- HTTP helpers --------------
 def _get(url, params=None):
@@ -209,7 +210,7 @@ with c2:
         ss.offer_sdp = None; ss.rtc_config = None
         debug("[stopped] session cleared")
 
-# ----------- Viewer embed (reduced height) -----------
+# ----------- Viewer embed (reduced height; no cropping) -----------
 viewer_path = Path(__file__).parent / "viewer.html"
 if not viewer_path.exists():
     st.warning("viewer.html not found next to streamlit_app.py.")
@@ -223,36 +224,43 @@ else:
             .replace("__OFFER_SDP__", json.dumps(ss.offer_sdp)[1:-1])  # raw newlines
             .replace("__RTC_CONFIG__", json.dumps(ss.rtc_config or {}))
         )
-        # height reduced from ~620 to 320 (≈50%)
-        components.html(html, height=320, scrolling=False)
+        components.html(html, height=340, scrolling=False)  # ~50% height
     else:
         st.info("Click **Start / Restart** to open a session and load the viewer.")
 
 # =================== Voice Recorder (mic_recorder) ===================
 st.write("---")
 st.subheader("Voice")
-st.caption("Tap **Start** to allow microphone • Speak • Tap **Stop**. The audio bar appears below; transcript is sent to the avatar via Test-2.")
+st.caption("Click **Start** to record and **Stop** when done. Transcription runs after stopping.")
 
 wav_bytes: Optional[bytes] = None
 if not _HAS_MIC:
     st.warning("`streamlit-mic-recorder` is not installed.")
 else:
-    # The mic widget (top-left 'Start' / 'Stop' as in your working app)
+    # Use a STABLE key so state isn’t lost on rerun.
     audio = mic_recorder(
         start_prompt="Start",
         stop_prompt="Stop",
         just_once=False,
         use_container_width=False,
+        key="mic_recorder",
         format="wav",
-        key=f"mic_{int(time.time())}",  # ensure fresh
     )
-    if audio:
+
+    if audio is None:
+        debug("[mic] waiting for recording…")
+    else:
+        # mic_recorder returns dict with .bytes after Stop
         if isinstance(audio, dict) and "bytes" in audio:
             wav_bytes = audio["bytes"]
+            debug(f"[mic] received {len(wav_bytes)} bytes")
         elif isinstance(audio, (bytes, bytearray)):
             wav_bytes = bytes(audio)
+            debug(f"[mic] received {len(wav_bytes)} bytes (raw)")
+        else:
+            debug(f"[mic] unexpected payload: {type(audio)}")
 
-# ---- Audio playback (shown ABOVE transcript)
+# ---- Audio playback (ABOVE transcript)
 if wav_bytes:
     st.audio(wav_bytes, format="audio/wav", autoplay=False)
 
@@ -262,13 +270,16 @@ if wav_bytes:
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp.write(wav_bytes); tmp.flush(); tmp_path = tmp.name
-            model = WhisperModel("base", compute_type="int8")
-            segments, info = model.transcribe(tmp_path, language="en", vad_filter=True)
-            text = " ".join([seg.text for seg in segments]).strip()
+            with st.spinner("Transcribing…"):
+                model = WhisperModel("base", compute_type="int8")
+                segments, info = model.transcribe(tmp_path, language="en", vad_filter=True)
+                text = " ".join([seg.text for seg in segments]).strip()
+        except Exception as e:
+            debug(f"[whisper] {e}")
         finally:
             try: os.remove(tmp_path)
             except Exception: pass
-    else:
+    if not text:
         # Fallback stub text (lets the pipeline work even without Whisper)
         import wave, io as _io
         try:
@@ -286,7 +297,7 @@ if wav_bytes:
 st.subheader("Transcript")
 ss.last_text = st.text_area(" ", value=ss.last_text, height=140, label_visibility="collapsed")
 
-# ============ Quick actions ============
+# ============ Actions ============
 st.write("")
 col1, col2 = st.columns(2, gap="small")
 with col1:
