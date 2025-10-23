@@ -6,17 +6,18 @@
     <title>AI Avatar Viewer (Direct WebRTC + Audio)</title>
     <style>
       html,body{margin:0;padding:0;height:100%;width:100%;background:#0b0b0c;color:#eaeaea;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
-      .wrap{display:flex;flex-direction:column;gap:10px;width:100%;height:100%;align-items:center;justify-content:flex-start}
-      .title{font-size:16px;text-align:center;margin-top:6px;opacity:.9}
-      .stage{position:relative;width:100%;max-width:420px;aspect-ratio:9/16;background:#111;border-radius:18px;overflow:hidden;border:1px solid #222;display:grid;place-items:center}
-      video{width:100%;height:100%;object-fit:cover;display:block}
+      .wrap{display:flex;flex-direction:column;gap:8px;width:100%;height:100%;align-items:center;justify-content:flex-start}
+      .title{font-size:15px;text-align:center;margin-top:6px;opacity:.9}
+      .stage{position:relative;width:100%;max-width:420px;aspect-ratio:16/9;background:#111;border-radius:18px;overflow:hidden;border:1px solid #222;display:grid;place-items:center}
+      /* Use contain to avoid cropping */
+      video{width:100%;height:100%;object-fit:contain;display:block;background:#0b0b0c}
       .status{font-size:12px;opacity:.85}
       .overlay{
         position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-        background:rgba(0,0,0,0.35); backdrop-filter:saturate(1.1) blur(1px);
+        background:rgba(0,0,0,0.25);
       }
       .overlay button{
-        border:none; border-radius:999px; padding:14px 18px; font-size:14px; cursor:pointer;
+        border:none; border-radius:999px; padding:12px 16px; font-size:14px; cursor:pointer;
         box-shadow:0 8px 22px rgba(0,0,0,.35);
       }
     </style>
@@ -25,7 +26,6 @@
     <div class="wrap">
       <div class="title">Avatar: <span id="aname"></span></div>
       <div class="stage">
-        <!-- Video shows picture only; audio routed to dedicated <audio> element -->
         <video id="video" playsinline autoplay muted></video>
         <div class="overlay" id="audioGate" style="display:flex">
           <button id="enableBtn">🔊 Tap to enable sound</button>
@@ -37,21 +37,17 @@
     <audio id="audio" autoplay></audio>
 
     <script>
-      // Injected by Streamlit
       const SESSION_TOKEN = "__SESSION_TOKEN__";
       const AVATAR_NAME   = "__AVATAR_NAME__";
       const SESSION_ID    = "__SESSION_ID__";
-      const OFFER_SDP     = "__OFFER_SDP__";          // raw text from API
-      const RTC_CONFIG    = __RTC_CONFIG__ || {};     // {"iceServers":[...]}
+      const OFFER_SDP     = "__OFFER_SDP__";
+      const RTC_CONFIG    = __RTC_CONFIG__ || {};
       document.getElementById("aname").textContent = AVATAR_NAME;
 
       const statusEl = document.getElementById("status");
       const setStatus = (t)=> statusEl.textContent = t;
 
-      // ---- DIRECT WEBRTC (no SDK) ----
       const pc = new RTCPeerConnection(RTC_CONFIG);
-
-      // Explicitly receive both audio and video
       try {
         pc.addTransceiver('audio', { direction: 'recvonly' });
         pc.addTransceiver('video', { direction: 'recvonly' });
@@ -63,34 +59,20 @@
       const btn   = document.getElementById("enableBtn");
 
       async function ensureAudio() {
-        try {
-          audio.muted = false;
-          audio.volume = 1.0;
-          await audio.play();
-          gate.style.display = "none";
-        } catch {
-          gate.style.display = "flex";
-        }
+        try { audio.muted = false; audio.volume = 1.0; await audio.play(); gate.style.display = "none"; }
+        catch { gate.style.display = "flex"; }
       }
-
-      btn.addEventListener('click', async () => {
-        try {
-          audio.muted = false;
-          audio.volume = 1.0;
-          await audio.play();
-          gate.style.display = "none";
-        } catch {}
-      });
+      btn.addEventListener('click', ensureAudio);
 
       pc.ontrack = (ev) => {
         const [stream] = ev.streams;
         if (!stream) return;
         if (ev.track.kind === 'video') {
           video.srcObject = stream;
-          video.muted = true;           // picture only
+          video.muted = true;
           video.play().catch(()=>{});
         } else if (ev.track.kind === 'audio') {
-          audio.srcObject = stream;     // sound goes here
+          audio.srcObject = stream;
           setTimeout(ensureAudio, 100);
         }
       };
@@ -112,7 +94,6 @@
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
 
-          // Wait for ICE to finish gathering local candidates (same timing as your working file)
           await new Promise((resolve) => {
             if (pc.iceGatheringState === "complete") return resolve();
             const check = () => {
@@ -140,7 +121,7 @@
           });
 
           setStatus("waiting for media…");
-          gate.style.display = "flex";  // show until audio is allowed
+          gate.style.display = "flex";
 
         } catch (err) {
           setStatus("init error");
