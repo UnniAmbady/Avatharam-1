@@ -1,4 +1,4 @@
-# streamlit_app.py — Step-by-step control bar + phase-driven viewer
+# streamlit_app.py — Step-by-step runner + mic fix + optional CORS proxy
 import os, json, time, base64
 from pathlib import Path
 from typing import Optional
@@ -24,7 +24,7 @@ st.markdown("""
   .ctrl-row .stButton > button { padding:6px 10px; height:38px; font-size:.85rem; border-radius:10px; }
   .stButton > button[kind=primary] { background:#ef4444; }
   iframe { border:none; border-radius:14px; }
-  /* hide internal start of streamlit-webrtc (prevents flashing red popup) */
+  /* hide internal streamlit-webrtc button (prevents flashing red popup) */
   div.st-webrtc > div:has(button) { display:none !important; }
 </style>
 """, unsafe_allow_html=True)
@@ -43,7 +43,8 @@ HEYGEN_API_KEY = get_heygen_key()
 if not HEYGEN_API_KEY:
     st.error("Missing HeyGen API key in .streamlit/secrets.toml under [HeyGen]."); st.stop()
 
-OPENAI_API_KEY = (st.secrets.get("openai", {}) or {}).get("api_key") or os.getenv("OPENAI_API_KEY")
+# optional: default proxy base from secrets
+DEFAULT_PROXY = (st.secrets.get("cors", {}) or {}).get("proxy", "")  # e.g. https://your-worker.example.com/proxy?url=
 
 AVATAR_ID = "Alessandra_CasualLook_public"
 VOICE_ID  = "0d3f35185d7c4360b9f03312e0264d59"
@@ -61,6 +62,7 @@ if "offer_sdp" not in st.session_state: st.session_state.offer_sdp = None
 if "rtc" not in st.session_state: st.session_state.rtc = None
 if "token" not in st.session_state: st.session_state.token = None
 if "phase" not in st.session_state: st.session_state.phase = "idle"  # idle|new|token|render|sdp_bearer|sdp_plain|sdp_nocors|mic_start|mic_stop
+if "proxy_base" not in st.session_state: st.session_state.proxy_base = DEFAULT_PROXY
 
 # ---------------------------
 # API helpers
@@ -85,34 +87,39 @@ def create_session_token(session_id: str) -> str:
     return d.get("token") or d.get("access_token")
 
 # ---------------------------
-# Control bar (single, left-aligned row)
+# Control bar (one line, left aligned)
 # ---------------------------
 st.markdown("##### Controls")
-col = st.container()
-with col:
-    c = st.columns(8, gap="small")
-    if c[0].button("1) New"):
+row = st.container()
+with row:
+    cols = st.columns(10, gap="small")
+    if cols[0].button("1) New"):
         st.session_state.sid, st.session_state.offer_sdp, st.session_state.rtc = new_session(AVATAR_ID, VOICE_ID)
         st.session_state.phase = "new"
-    if c[1].button("2) Token"):
+    if cols[1].button("2) Token"):
         if not st.session_state.sid: st.warning("Run 1) New first.")
         else:
             st.session_state.token = create_session_token(st.session_state.sid)
             st.session_state.phase = "token"
-    if c[2].button("3) Render"):
+    if cols[2].button("3) Render"):
         if not (st.session_state.sid and st.session_state.token): st.warning("Run 1) & 2) first.")
         else:
             st.session_state.phase = "render"
-    if c[3].button("4A SDP Bearer"):
+    if cols[3].button("4A Bearer"):
         st.session_state.phase = "sdp_bearer"
-    if c[4].button("4B SDP Plain"):
+    if cols[4].button("4B Plain"):
         st.session_state.phase = "sdp_plain"
-    if c[5].button("4C SDP no-cors"):
+    if cols[5].button("4C no-cors"):
         st.session_state.phase = "sdp_nocors"
-    if c[6].button("5) Mic ▶"):
+    if cols[6].button("5) Mic ▶"):
         st.session_state.phase = "mic_start"
-    if c[7].button("⏹ Mic"):
+    if cols[7].button("⏹ Mic"):
         st.session_state.phase = "mic_stop"
+    if cols[8].button("Reset"):
+        for k in ("sid","offer_sdp","rtc","token","phase"): st.session_state[k] = None if k!="phase" else "idle"
+        st.rerun()
+    with cols[9]:
+        st.session_state.proxy_base = st.text_input("Proxy", st.session_state.proxy_base, placeholder="https://<your-proxy>/proxy?url=", label_visibility="collapsed")
 
 # ---------------------------
 # Viewer render (phase-driven)
@@ -130,19 +137,18 @@ def render_viewer():
         .replace("__OFFER_SDP_B64__", sdp_b64)
         .replace("__RTC_CONFIG_LITERAL__", rtc_literal)
         .replace("__API_BASE__", BASE)
-        .replace("__PHASE__", st.session_state.phase)  # tells viewer what to do
+        .replace("__PHASE__", st.session_state.phase or "idle")
+        .replace("__PROXY_BASE__", st.session_state.proxy_base or "")
     )
-    components.html(html, height=620, scrolling=False)
+    components.html(html, height=640, scrolling=False)
 
-# auto-render viewer once you’ve created session+token (or any time you press Render / SDP buttons)
 if st.session_state.phase in {"render","sdp_bearer","sdp_plain","sdp_nocors"} and st.session_state.sid and st.session_state.token:
     render_viewer()
 elif st.session_state.phase in {"new","token"}:
-    # show a small hint to press Render next
     st.info("Press **3) Render** to load viewer. Then try **4A/4B/4C** for SDP submit.")
 
 # ---------------------------
-# Optional mic echo (separate from viewer)
+# Mic echo (fixed initialization)
 # ---------------------------
 class _MicProc(AudioProcessorBase):
     def __init__(self): self.buf=b""; self.sample_rate=16000
@@ -160,15 +166,19 @@ class _MicProc(AudioProcessorBase):
         self.buf += pcm16.tobytes()
         return frame
 
-if "webrtc_ctx" not in st.session_state: st.session_state.webrtc_ctx = None
-if "mic_proc" not in st.session_state:   st.session_state.mic_proc = None
+# robust init BEFORE using in the factory
+if "mic_proc" not in st.session_state or st.session_state.mic_proc is None:
+    st.session_state.mic_proc = _MicProc()
+
+if "webrtc_ctx" not in st.session_state:
+    st.session_state.webrtc_ctx = None
 
 if st.session_state.phase == "mic_start" and _HAS_WEBRTC:
-    if st.session_state.mic_proc is None: st.session_state.mic_proc = _MicProc()
+    proc_instance = st.session_state.mic_proc  # bind now; don't reference session_state inside worker thread
     st.session_state.webrtc_ctx = webrtc_streamer(
         key="mic-only",
         mode=WebRtcMode.SENDONLY,
-        audio_processor_factory=lambda: st.session_state.mic_proc,
+        audio_processor_factory=lambda: proc_instance,
         media_stream_constraints={"audio": True, "video": False},
         async_processing=False,
     )
