@@ -1,7 +1,7 @@
-# ver-10.3.1
-# HeyGen — Stage.2.Ver.7 base + Voice Echo (Start/Stop) + Debug box
+# ver-10.5
+# HeyGen — Stage.2.Ver.7 base + Voice Echo (record-until-stop) + Debug box
 # Flow: streaming.new -> streaming.create_token -> sleep(1s) -> viewer.start
-# Changes vs 10.2: Voice now records continuously; on Stop -> transcribe once -> print -> echo.
+# Voice: Start records; Stop -> finalize -> stub "transcription" -> print -> echo to avatar.
 
 import json
 import time
@@ -12,10 +12,10 @@ from typing import Optional
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+import numpy as np  # used for simple energy check & resampling
 
-# Optional voice (Whisper) + mic
+# Optional mic capture
 try:
-    import numpy as np
     from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
     _HAS_WEBRTC = True
 except Exception:
@@ -51,8 +51,6 @@ HEYGEN_API_KEY = _get(SECRETS, "HeyGen", "heygen_api_key") or _get(SECRETS, "hey
 if not HEYGEN_API_KEY:
     st.error("Missing HeyGen API key in `.streamlit/secrets.toml`.\n\n[HeyGen]\nheygen_api_key = \"…\"")
     st.stop()
-
-OPENAI_API_KEY = _get(SECRETS, "openai", "secret_key") or _get(SECRETS, "openai", "api_key") or os.getenv("OPENAI_API_KEY")
 
 # --------------- Endpoints --------------
 BASE = "https://api.heygen.com/v1"
@@ -202,6 +200,23 @@ def stop_session(session_id: str, session_token: str):
     except Exception as e:
         debug(f"[stop_session] {e}")
 
+# --------- Local "transcriber" stub (no OpenAI yet) ----------
+def transcribe_audio_stub(pcm_bytes: bytes, rate: int, seconds: float) -> str:
+    """
+    No external API. If audio exists and has minimal energy, return a readable line.
+    This lets you see text in Debug and feed it to the avatar right now.
+    """
+    if not pcm_bytes or seconds <= 0.05:
+        return ""
+    arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if arr.size == 0:
+        return ""
+    # simple energy gate to avoid noise
+    rms = float(np.sqrt(np.mean(arr.astype(np.float32)**2)))
+    if rms < 50.0:
+        return ""
+    return f"I heard you for about {seconds:.1f} seconds."
+
 # ---------- Streamlit state ----------
 ss.setdefault("session_id", None)
 ss.setdefault("session_token", None)
@@ -261,7 +276,7 @@ else:
     else:
         st.info("Click **Start / Restart** to open a session and load the viewer.")
 
-# ---------- Buttons row (keep Test-1 identical) ----------
+# ---------- Buttons row ----------
 st.write("---")
 b1, b2, b3, b4, b5 = st.columns(5)
 def _need_session():
@@ -275,7 +290,7 @@ with b1:
             send_echo(ss.session_id, ss.session_token,
                       "Hello. Welcome to the test demonstration.")
 
-# ----- Voice Start / Stop (Echo) — record until Stop, then transcribe once -----
+# ----- Voice Start / Stop (record-until-stop) -----
 
 # where we mount the webrtc component
 if "webrtc_slot" not in st.session_state:
@@ -296,18 +311,21 @@ with b3:
     if st.button("Voice Stop", use_container_width=True):
         ss.voice_run = False
         # finalize BEFORE tearing down the component
-        final_text = None
+        final_text = ""
         try:
             if ss.voice_rec is not None:
                 pcm_bytes, secs = ss.voice_rec.finalize()
                 debug(f"[voice] captured ~{secs:.2f}s audio ({len(pcm_bytes)} bytes)")
-                final_text = transcribe_whisper(pcm_bytes, 16000)
+
+                # Use local stub (no OpenAI call right now)
+                final_text = transcribe_audio_stub(pcm_bytes, 16000, secs)
+
                 if final_text:
                     debug(f"[voice→text] {final_text}")
                     if ss.session_id and ss.session_token:
                         send_echo(ss.session_id, ss.session_token, final_text)
                 else:
-                    debug("[voice→text] (no text or Whisper unavailable)")
+                    debug("[voice→text] (no text produced)")
         except Exception as e:
             debug(f"[voice finalize] {e}")
 
@@ -330,9 +348,8 @@ with b4:
 with b5:
     st.write("")
 
-# ----------------- Voice Echo (record-until-stop) -----------------
+# ----------------- Voice recorder (runs while voice_run=True) -----------------
 if _HAS_WEBRTC and ss.voice_run and ss.session_id and ss.session_token:
-    import wave, tempfile
     from threading import Lock
 
     class EchoRecorder(AudioProcessorBase):
@@ -372,37 +389,12 @@ if _HAS_WEBRTC and ss.voice_run and ss.session_id and ss.session_token:
             return frame
 
         def finalize(self):
-            # return and clear buffer
             with self.lock:
                 pcm = bytes(self.buf)
                 secs = self.total_samples / float(self.sample_rate) if self.sample_rate else 0.0
                 self.buf.clear()
                 self.total_samples = 0
             return pcm, secs
-
-        # place this near the other helper functions (around line 170, after send_echo)
-        
-        def transcribe_whisper(pcm_bytes: bytes, rate: int) -> Optional[str]:
-            if not OPENAI_API_KEY or not pcm_bytes:
-                return None
-            try:
-                from openai import OpenAI
-                import tempfile, wave
-                client = OpenAI(api_key=OPENAI_API_KEY)
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    path = tmp.name
-                with wave.open(path, "wb") as w:
-                    w.setnchannels(1)
-                    w.setsampwidth(2)
-                    w.setframerate(rate)
-                    w.writeframes(pcm_bytes)
-                with open(path, "rb") as f:
-                    resp = client.audio.transcriptions.create(model="whisper-1", file=f)
-                return (getattr(resp, "text", "") or "").strip() or None
-            except Exception as e:
-                debug(f"[whisper] {e}")
-                return None
-
 
     # create a new recorder for this run, mount webrtc
     rec = EchoRecorder()
