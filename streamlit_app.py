@@ -1,25 +1,33 @@
-# ver-10.6
-# HeyGen — Stage.2.Ver.7 base + Voice Echo (record-until-stop) + Debug + Mic diagnostics
-# Voice: Start records; Stop -> finalize -> stub "transcription" -> print -> echo to avatar.
-# Adds: mic permission probe (JS) + watchdog if no audio frames arrive.
+# ver-11
+# HeyGen avatar + mic recorder (streamlit-mic-recorder) + faster-whisper transcription
+# Flow: Start/Restart -> viewer connected -> record (Start/Stop) -> transcribe -> show text -> send to avatar (echo)
 
 import json
-import time
 import os
+import time
+import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
+import numpy as np
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-import numpy as np  # signal utils
 
-# Optional mic capture
+# ---- Optional STT backends ----
 try:
-    from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
-    _HAS_WEBRTC = True
+    from faster_whisper import WhisperModel  # local inference
+    _HAS_FWHISPER = True
 except Exception:
-    _HAS_WEBRTC = False
+    WhisperModel = None  # type: ignore
+    _HAS_FWHISPER = False
+
+try:
+    from streamlit_mic_recorder import mic_recorder
+    _HAS_MIC = True
+except Exception:
+    mic_recorder = None  # type: ignore
+    _HAS_MIC = False
 
 # ---------------- Page ----------------
 st.set_page_config(page_title="AI Avatar Demo", layout="centered")
@@ -27,12 +35,10 @@ st.title("AI Avatar Demo")
 
 st.markdown("""
 <style>
-  .block-container { padding-top:.5rem; }
-  .ctrl-row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
-  .ctrl-row .stButton > button { height:40px; padding:0 12px; font-size:.9rem; border-radius:10px; }
-  iframe { border:none; border-radius:16px; }
-  /* hide internal start of streamlit-webrtc to avoid flashing red button */
-  div.st-webrtc > div:has(button) { display:none !important; }
+  .block-container { padding-top: .6rem; padding-bottom: 1.2rem; }
+  iframe { border: none; border-radius: 16px; }
+  .rowbtn .stButton>button { height: 40px; font-size: .95rem; border-radius: 12px; }
+  .smallcaps { opacity: .8; font-size: .9rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -154,8 +160,7 @@ selected = next(a for a in avatars if a["label"] == choice)
 # ------------- Session helpers -------------
 def new_session(avatar_id: str, voice_id: Optional[str] = None):
     payload = {"avatar_id": avatar_id}
-    if voice_id:
-        payload["voice_id"] = voice_id
+    if voice_id: payload["voice_id"] = voice_id
     _, body, _ = _post_xapi(API_STREAM_NEW, payload)
     data = body.get("data") or {}
 
@@ -196,31 +201,12 @@ def stop_session(session_id: str, session_token: str):
     except Exception as e:
         debug(f"[stop_session] {e}")
 
-# --------- Local "transcriber" stub (no OpenAI yet) ----------
-def transcribe_audio_stub(pcm_bytes: bytes, rate: int, seconds: float) -> str:
-    """
-    No external API. If audio exists and has minimal energy, return a readable line.
-    Lets you see text in Debug and feed it to the avatar right now.
-    """
-    if not pcm_bytes or seconds <= 0.05:
-        return ""
-    arr = np.frombuffer(pcm_bytes, dtype=np.int16)
-    if arr.size == 0:
-        return ""
-    # simple energy gate to avoid noise
-    rms = float(np.sqrt(np.mean(arr.astype(np.float32)**2)))
-    if rms < 50.0:
-        return ""
-    return f"I heard you for about {seconds:.1f} seconds."
-
 # ---------- Streamlit state ----------
 ss.setdefault("session_id", None)
 ss.setdefault("session_token", None)
 ss.setdefault("offer_sdp", None)
 ss.setdefault("rtc_config", None)
-ss.setdefault("mic_perm", None)            # last known browser mic permission
-ss.setdefault("voice_warned", False)       # watchdog logged?
-ss.setdefault("voice_start_ts", 0.0)       # when we started capture
+ss.setdefault("last_text", "")
 
 # -------------- Controls row --------------
 st.write("")
@@ -254,7 +240,7 @@ with c2:
         ss.offer_sdp = None; ss.rtc_config = None
         debug("[stopped] session cleared")
 
-# ----------- Viewer embed (exactly as working) -----------
+# ----------- Viewer embed (your working viewer) -----------
 viewer_path = Path(__file__).parent / "viewer.html"
 if not viewer_path.exists():
     st.warning("viewer.html not found next to streamlit_app.py.")
@@ -272,182 +258,94 @@ else:
     else:
         st.info("Click **Start / Restart** to open a session and load the viewer.")
 
-# ---------- Buttons row ----------
-st.write("---")
-b1, b2, b3, b4, b5 = st.columns(5)
-def _need_session():
-    return not (ss.session_id and ss.session_token and ss.offer_sdp)
+# =================== Voice Recorder (streamlit-mic-recorder) ===================
 
-with b1:
+st.write("---")
+st.subheader("Voice (record, then Stop to send)")
+
+if not _HAS_MIC:
+    st.warning("`streamlit-mic-recorder` is not installed. Add it to requirements and redeploy.")
+else:
+    st.caption("Press **Start** to allow microphone. Speak, then press **Stop**. Transcription runs after stopping.")
+    audio = mic_recorder(
+        start_prompt="Start",
+        stop_prompt="Stop",
+        just_once=False,
+        use_container_width=False,
+        format="wav",   # get WAV bytes directly
+        callback=None,
+        key=f"mic_{int(time.time())}",   # simple freshness
+    )
+
+    wav_bytes: Optional[bytes] = None
+    if audio:
+        if isinstance(audio, dict) and "bytes" in audio:
+            wav_bytes = audio["bytes"]
+        elif isinstance(audio, (bytes, bytearray)):
+            wav_bytes = bytes(audio)
+
+    # Show player if something arrived
+    if wav_bytes:
+        st.audio(wav_bytes, format="audio/wav", autoplay=False)
+
+        # ---- Transcribe
+        text = ""
+        if _HAS_FWHISPER:
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp.write(wav_bytes)
+                    tmp.flush()
+                    tmp_path = tmp.name
+
+                model = WhisperModel("base", compute_type="int8")
+                segments, info = model.transcribe(tmp_path, language="en", vad_filter=True)
+                parts = [seg.text for seg in segments]
+                text = " ".join(parts).strip()
+            finally:
+                try: os.remove(tmp_path)
+                except Exception: pass
+        else:
+            # Fallback stub: estimate seconds and return a readable line
+            try:
+                import wave, io as _io
+                with wave.open(_io.BytesIO(wav_bytes), "rb") as w:
+                    frames = w.getnframes()
+                    rate = w.getframerate()
+                    secs = frames / float(rate or 16000)
+                text = f"I heard you for about {secs:.1f} seconds."
+            except Exception:
+                text = "Thanks! (audio captured)"
+
+        # ---- Show & echo
+        ss.last_text = text
+        st.text_area("Transcript", value=ss.last_text, height=160, key="ta_out")
+        debug(f"[voice→text] {text if text else '(empty)'}")
+
+        if ss.session_id and ss.session_token and text:
+            send_echo(ss.session_id, ss.session_token, text)
+
+# -------------- Quick actions row --------------
+st.write("")
+r1, r2, r3, r4 = st.columns(4, gap="small")
+with r1:
     if st.button("Test-1", use_container_width=True):
-        if _need_session():
+        if not (ss.session_id and ss.session_token and ss.offer_sdp):
             st.warning("Start a session first.")
         else:
             send_echo(ss.session_id, ss.session_token,
                       "Hello. Welcome to the test demonstration.")
-
-# ----- Voice Start / Stop (record-until-stop) -----
-
-# where we mount the webrtc component
-if "webrtc_slot" not in st.session_state:
-    st.session_state.webrtc_slot = st.empty()
-if "webrtc_ctx" not in st.session_state:
-    st.session_state.webrtc_ctx = None
-if "voice_run" not in st.session_state:
-    st.session_state.voice_run = False
-if "voice_rec" not in st.session_state:
-    st.session_state.voice_rec = None  # recorder instance
-
-with b2:
-    if st.button("Voice Start", use_container_width=True):
-        ss.voice_run = True
-        ss.voice_warned = False
-        ss.voice_start_ts = time.time()
-        debug("[voice] start requested")
-
-        # ---- Mic permission probe (JS -> returns 'granted'|'prompt'|'denied'|'unsupported') ----
-        mic_state = components.html("""
-            <script>
-            (async function() {
-              try {
-                if (!navigator.permissions || !navigator.permissions.query) {
-                  Streamlit.setComponentValue("unsupported");
-                  return;
-                }
-                const p = await navigator.permissions.query({ name: "microphone" });
-                Streamlit.setComponentValue(p.state || "unknown");
-              } catch (e) {
-                Streamlit.setComponentValue("unsupported");
-              }
-            })();
-            </script>
-        """, height=0)
-        if mic_state is not None:
-            ss.mic_perm = str(mic_state)
-            debug(f"[mic permission] {ss.mic_perm}")
-
-with b3:
-    if st.button("Voice Stop", use_container_width=True):
-        ss.voice_run = False
-        final_text = ""
-        try:
-            if ss.voice_rec is not None:
-                pcm_bytes, secs = ss.voice_rec.finalize()
-                debug(f"[voice] captured ~{secs:.2f}s audio ({len(pcm_bytes)} bytes)")
-
-                # Use local stub (no OpenAI call right now)
-                final_text = transcribe_audio_stub(pcm_bytes, 16000, secs)
-
-                if final_text:
-                    debug(f"[voice→text] {final_text}")
-                    if ss.session_id and ss.session_token:
-                        send_echo(ss.session_id, ss.session_token, final_text)
-                else:
-                    debug("[voice→text] (no text produced)")
-        except Exception as e:
-            debug(f"[voice finalize] {e}")
-
-        # Remove the component from the page — cleanly stops the stream
-        try:
-            st.session_state.webrtc_slot.empty()
-        except Exception:
-            pass
-        st.session_state.webrtc_ctx = None
-        st.session_state.voice_rec = None
-        debug("[voice] stop requested")
-
-with b4:
+with r2:
+    if st.button("Clear text", use_container_width=True):
+        ss.last_text = ""
+        st.rerun()
+with r3:
     if st.button("Reset", use_container_width=True):
-        for k in ("session_id","session_token","offer_sdp","rtc_config","voice_run"):
+        for k in ("session_id","session_token","offer_sdp","rtc_config","last_text"):
             ss[k] = None
         ss.debug_buf.clear()
         st.rerun()
+with r4:
+    st.caption("")
 
-with b5:
-    st.write("")
-
-# ----------------- Voice recorder (runs while voice_run=True) -----------------
-if _HAS_WEBRTC and ss.voice_run and ss.session_id and ss.session_token:
-    from threading import Lock
-
-    class EchoRecorder(AudioProcessorBase):
-        """
-        Accumulates PCM16 at 16 kHz mono until Stop.
-        On finalize() returns (pcm_bytes, seconds).
-        """
-        def __init__(self):
-            self.sample_rate = 16000
-            self.buf = bytearray()
-            self.lock = Lock()
-            self.total_samples = 0
-            self.frames_seen = 0
-
-        def recv_audio(self, frame):
-            try:
-                pcm16 = frame.to_ndarray(format="s16")
-                if pcm16.ndim == 2 and pcm16.shape[0] > 1:
-                    pcm16 = pcm16[0:1, :]
-                pcm16 = np.squeeze(pcm16).astype(np.int16)
-                in_rate = frame.sample_rate
-
-                # resample if needed
-                if in_rate != self.sample_rate:
-                    dur = pcm16.shape[0] / in_rate
-                    new_len = int(dur * self.sample_rate)
-                    pcm16 = np.interp(
-                        np.linspace(0, pcm16.shape[0] - 1, new_len),
-                        np.arange(pcm16.shape[0]),
-                        pcm16.astype(np.float32),
-                    ).astype(np.int16)
-
-                with self.lock:
-                    self.buf += pcm16.tobytes()
-                    self.total_samples += len(pcm16)
-                    self.frames_seen += 1
-            except Exception as e:
-                debug(f"[audio] {e}")
-            return frame
-
-        def finalize(self):
-            with self.lock:
-                pcm = bytes(self.buf)
-                secs = self.total_samples / float(self.sample_rate) if self.sample_rate else 0.0
-                self.buf.clear()
-                self.total_samples = 0
-                self.frames_seen = 0
-            return pcm, secs
-
-    # create a new recorder for this run, mount webrtc
-    rec = EchoRecorder()
-    ss.voice_rec = rec
-    with st.session_state.webrtc_slot.container():
-        st.session_state.webrtc_ctx = webrtc_streamer(
-            key="mic-echo",
-            mode=WebRtcMode.SENDONLY,
-            audio_processor_factory=lambda: rec,
-            media_stream_constraints={
-                # Be explicit; some browsers are picky.
-                "audio": {
-                    "echoCancellation": True,
-                    "noiseSuppression": True,
-                    "autoGainControl": True
-                },
-                "video": False
-            },
-            async_processing=False,
-        )
-    st.caption("Voice echo is recording… Speak, then press Voice Stop.")
-
-    # ---- Watchdog: if no frames after ~3s, log a clear hint ----
-    if (time.time() - ss.voice_start_ts) > 3.0 and not ss.voice_warned:
-        if ss.voice_rec and ss.voice_rec.frames_seen == 0:
-            ss.voice_warned = True
-            hint = (
-                "[mic] No audio frames received. "
-                "Possible causes: mic permission blocked, no input device, or browser policy. "
-                "On iPhone: use Safari/Chrome; ensure site has Microphone = Allow (Settings ▸ Safari ▸ Advanced ▸ Website Data or per-site settings)."
-            )
-            debug(hint)
-
-# -------------- Debug box (disabled) --------------
-st.text_area("Debug", value="\n".join(ss.debug_buf), height=240, disabled=True)
+# -------------- Debug box --------------
+st.text_area("Debug", value="\n".join(ss.debug_buf), height=220, disabled=True)
