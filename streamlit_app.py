@@ -1,7 +1,7 @@
-# ver-10.5
-# HeyGen — Stage.2.Ver.7 base + Voice Echo (record-until-stop) + Debug box
-# Flow: streaming.new -> streaming.create_token -> sleep(1s) -> viewer.start
+# ver-10.6
+# HeyGen — Stage.2.Ver.7 base + Voice Echo (record-until-stop) + Debug + Mic diagnostics
 # Voice: Start records; Stop -> finalize -> stub "transcription" -> print -> echo to avatar.
+# Adds: mic permission probe (JS) + watchdog if no audio frames arrive.
 
 import json
 import time
@@ -12,7 +12,7 @@ from typing import Optional
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-import numpy as np  # used for simple energy check & resampling
+import numpy as np  # signal utils
 
 # Optional mic capture
 try:
@@ -72,13 +72,13 @@ def headers_bearer(token: str):
         "Content-Type": "application/json",
     }
 
-# --------- Debug buffer (UI text area) ----------
+# --------- Debug buffer ----------
 ss = st.session_state
 ss.setdefault("debug_buf", [])
 def debug(msg: str):
     ss.debug_buf.append(str(msg))
-    if len(ss.debug_buf) > 800:
-        ss.debug_buf[:] = ss.debug_buf[-800:]
+    if len(ss.debug_buf) > 1000:
+        ss.debug_buf[:] = ss.debug_buf[-1000:]
 
 # ------------- HTTP helpers --------------
 def _get(url, params=None):
@@ -90,8 +90,7 @@ def _get(url, params=None):
         body = {"_raw": raw}
     debug(f"[GET] {url} -> {r.status_code}")
     if r.status_code >= 400:
-        debug(raw)
-        r.raise_for_status()
+        debug(raw); r.raise_for_status()
     return r.status_code, body, raw
 
 def _post_xapi(url, payload=None):
@@ -103,8 +102,7 @@ def _post_xapi(url, payload=None):
         body = {"_raw": raw}
     debug(f"[POST x-api] {url} -> {r.status_code}")
     if r.status_code >= 400:
-        debug(raw)
-        r.raise_for_status()
+        debug(raw); r.raise_for_status()
     return r.status_code, body, raw
 
 def _post_bearer(url, token, payload=None):
@@ -116,8 +114,7 @@ def _post_bearer(url, token, payload=None):
         body = {"_raw": raw}
     debug(f"[POST bearer] {url} -> {r.status_code}")
     if r.status_code >= 400:
-        debug(raw)
-        r.raise_for_status()
+        debug(raw); r.raise_for_status()
     return r.status_code, body, raw
 
 # --------- Avatars (ACTIVE only) ---------
@@ -181,8 +178,7 @@ def new_session(avatar_id: str, voice_id: Optional[str] = None):
 def create_session_token(session_id: str) -> str:
     _, body, _ = _post_xapi(API_CREATE_TOKEN, {"session_id": session_id})
     tok = (body.get("data") or {}).get("token") or (body.get("data") or {}).get("access_token")
-    if not tok:
-        raise RuntimeError(f"Missing token in response: {body}")
+    if not tok: raise RuntimeError(f"Missing token in response: {body}")
     return tok
 
 def send_echo(session_id: str, session_token: str, text: str):
@@ -204,7 +200,7 @@ def stop_session(session_id: str, session_token: str):
 def transcribe_audio_stub(pcm_bytes: bytes, rate: int, seconds: float) -> str:
     """
     No external API. If audio exists and has minimal energy, return a readable line.
-    This lets you see text in Debug and feed it to the avatar right now.
+    Lets you see text in Debug and feed it to the avatar right now.
     """
     if not pcm_bytes or seconds <= 0.05:
         return ""
@@ -222,6 +218,9 @@ ss.setdefault("session_id", None)
 ss.setdefault("session_token", None)
 ss.setdefault("offer_sdp", None)
 ss.setdefault("rtc_config", None)
+ss.setdefault("mic_perm", None)            # last known browser mic permission
+ss.setdefault("voice_warned", False)       # watchdog logged?
+ss.setdefault("voice_start_ts", 0.0)       # when we started capture
 
 # -------------- Controls row --------------
 st.write("")
@@ -229,8 +228,7 @@ c1, c2 = st.columns(2)
 with c1:
     if st.button("Start / Restart", use_container_width=True):
         if ss.session_id and ss.session_token:
-            stop_session(ss.session_id, ss.session_token)
-            time.sleep(0.2)
+            stop_session(ss.session_id, ss.session_token); time.sleep(0.2)
 
         debug("Step 1: streaming.new")
         payload = new_session(selected["avatar_id"], selected.get("default_voice"))
@@ -252,10 +250,8 @@ with c2:
     if st.button("Stop", type="secondary", use_container_width=True):
         if ss.session_id and ss.session_token:
             stop_session(ss.session_id, ss.session_token)
-        ss.session_id = None
-        ss.session_token = None
-        ss.offer_sdp = None
-        ss.rtc_config = None
+        ss.session_id = None; ss.session_token = None
+        ss.offer_sdp = None; ss.rtc_config = None
         debug("[stopped] session cleared")
 
 # ----------- Viewer embed (exactly as working) -----------
@@ -305,12 +301,34 @@ if "voice_rec" not in st.session_state:
 with b2:
     if st.button("Voice Start", use_container_width=True):
         ss.voice_run = True
+        ss.voice_warned = False
+        ss.voice_start_ts = time.time()
         debug("[voice] start requested")
+
+        # ---- Mic permission probe (JS -> returns 'granted'|'prompt'|'denied'|'unsupported') ----
+        mic_state = components.html("""
+            <script>
+            (async function() {
+              try {
+                if (!navigator.permissions || !navigator.permissions.query) {
+                  Streamlit.setComponentValue("unsupported");
+                  return;
+                }
+                const p = await navigator.permissions.query({ name: "microphone" });
+                Streamlit.setComponentValue(p.state || "unknown");
+              } catch (e) {
+                Streamlit.setComponentValue("unsupported");
+              }
+            })();
+            </script>
+        """, height=0)
+        if mic_state is not None:
+            ss.mic_perm = str(mic_state)
+            debug(f"[mic permission] {ss.mic_perm}")
 
 with b3:
     if st.button("Voice Stop", use_container_width=True):
         ss.voice_run = False
-        # finalize BEFORE tearing down the component
         final_text = ""
         try:
             if ss.voice_rec is not None:
@@ -362,6 +380,7 @@ if _HAS_WEBRTC and ss.voice_run and ss.session_id and ss.session_token:
             self.buf = bytearray()
             self.lock = Lock()
             self.total_samples = 0
+            self.frames_seen = 0
 
         def recv_audio(self, frame):
             try:
@@ -384,6 +403,7 @@ if _HAS_WEBRTC and ss.voice_run and ss.session_id and ss.session_token:
                 with self.lock:
                     self.buf += pcm16.tobytes()
                     self.total_samples += len(pcm16)
+                    self.frames_seen += 1
             except Exception as e:
                 debug(f"[audio] {e}")
             return frame
@@ -394,6 +414,7 @@ if _HAS_WEBRTC and ss.voice_run and ss.session_id and ss.session_token:
                 secs = self.total_samples / float(self.sample_rate) if self.sample_rate else 0.0
                 self.buf.clear()
                 self.total_samples = 0
+                self.frames_seen = 0
             return pcm, secs
 
     # create a new recorder for this run, mount webrtc
@@ -404,10 +425,29 @@ if _HAS_WEBRTC and ss.voice_run and ss.session_id and ss.session_token:
             key="mic-echo",
             mode=WebRtcMode.SENDONLY,
             audio_processor_factory=lambda: rec,
-            media_stream_constraints={"audio": True, "video": False},
+            media_stream_constraints={
+                # Be explicit; some browsers are picky.
+                "audio": {
+                    "echoCancellation": True,
+                    "noiseSuppression": True,
+                    "autoGainControl": True
+                },
+                "video": False
+            },
             async_processing=False,
         )
     st.caption("Voice echo is recording… Speak, then press Voice Stop.")
 
+    # ---- Watchdog: if no frames after ~3s, log a clear hint ----
+    if (time.time() - ss.voice_start_ts) > 3.0 and not ss.voice_warned:
+        if ss.voice_rec and ss.voice_rec.frames_seen == 0:
+            ss.voice_warned = True
+            hint = (
+                "[mic] No audio frames received. "
+                "Possible causes: mic permission blocked, no input device, or browser policy. "
+                "On iPhone: use Safari/Chrome; ensure site has Microphone = Allow (Settings ▸ Safari ▸ Advanced ▸ Website Data or per-site settings)."
+            )
+            debug(hint)
+
 # -------------- Debug box (disabled) --------------
-st.text_area("Debug", value="\n".join(ss.debug_buf), height=220, disabled=True)
+st.text_area("Debug", value="\n".join(ss.debug_buf), height=240, disabled=True)
