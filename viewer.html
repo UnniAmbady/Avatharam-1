@@ -3,29 +3,27 @@
   <head>
     <meta charset="utf-8"/>
     <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
-    <title>AI Avatar Viewer (Direct WebRTC + Audio)</title>
+    <title>AI Avatar Viewer (WebRTC)</title>
     <style>
       html,body{margin:0;padding:0;height:100%;width:100%;background:#0b0b0c;color:#eaeaea;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
       .wrap{display:flex;flex-direction:column;gap:8px;width:100%;height:100%;align-items:center;justify-content:flex-start}
       .title{font-size:15px;text-align:center;margin-top:6px;opacity:.9}
-      .stage{position:relative;width:100%;max-width:420px;aspect-ratio:16/9;background:#111;border-radius:18px;overflow:hidden;border:1px solid #222;display:grid;place-items:center}
-      /* Use contain to avoid cropping */
+      .stage{
+        position:relative;width:100%;max-width:420px;
+        aspect-ratio:16/9; /* default; updated to real stream AR after first frame */
+        background:#111;border-radius:18px;overflow:hidden;border:1px solid #222;
+        display:grid;place-items:center
+      }
       video{width:100%;height:100%;object-fit:contain;display:block;background:#0b0b0c}
       .status{font-size:12px;opacity:.85}
-      .overlay{
-        position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-        background:rgba(0,0,0,0.25);
-      }
-      .overlay button{
-        border:none; border-radius:999px; padding:12px 16px; font-size:14px; cursor:pointer;
-        box-shadow:0 8px 22px rgba(0,0,0,.35);
-      }
+      .overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.25)}
+      .overlay button{border:none;border-radius:999px;padding:12px 16px;font-size:14px;cursor:pointer;box-shadow:0 8px 22px rgba(0,0,0,.35)}
     </style>
   </head>
   <body>
     <div class="wrap">
       <div class="title">Avatar: <span id="aname"></span></div>
-      <div class="stage">
+      <div class="stage" id="stage">
         <video id="video" playsinline autoplay muted></video>
         <div class="overlay" id="audioGate" style="display:flex">
           <button id="enableBtn">🔊 Tap to enable sound</button>
@@ -37,26 +35,22 @@
     <audio id="audio" autoplay></audio>
 
     <script>
+      // Injected by Streamlit
       const SESSION_TOKEN = "__SESSION_TOKEN__";
       const AVATAR_NAME   = "__AVATAR_NAME__";
       const SESSION_ID    = "__SESSION_ID__";
       const OFFER_SDP     = "__OFFER_SDP__";
       const RTC_CONFIG    = __RTC_CONFIG__ || {};
+
+      // UI helpers
+      const stage   = document.getElementById("stage");
+      const video   = document.getElementById("video");
+      const audio   = document.getElementById("audio");
+      const gate    = document.getElementById("audioGate");
+      const btn     = document.getElementById("enableBtn");
+      const statusEl= document.getElementById("status");
       document.getElementById("aname").textContent = AVATAR_NAME;
-
-      const statusEl = document.getElementById("status");
       const setStatus = (t)=> statusEl.textContent = t;
-
-      const pc = new RTCPeerConnection(RTC_CONFIG);
-      try {
-        pc.addTransceiver('audio', { direction: 'recvonly' });
-        pc.addTransceiver('video', { direction: 'recvonly' });
-      } catch {}
-
-      const video = document.getElementById("video");
-      const audio = document.getElementById("audio");
-      const gate  = document.getElementById("audioGate");
-      const btn   = document.getElementById("enableBtn");
 
       async function ensureAudio() {
         try { audio.muted = false; audio.volume = 1.0; await audio.play(); gate.style.display = "none"; }
@@ -64,69 +58,133 @@
       }
       btn.addEventListener('click', ensureAudio);
 
-      pc.ontrack = (ev) => {
-        const [stream] = ev.streams;
-        if (!stream) return;
-        if (ev.track.kind === 'video') {
-          video.srcObject = stream;
-          video.muted = true;
-          video.play().catch(()=>{});
-        } else if (ev.track.kind === 'audio') {
-          audio.srcObject = stream;
-          setTimeout(ensureAudio, 100);
+      // Adaptive aspect ratio once we know the stream dimensions
+      function applyAdaptiveAR() {
+        const w = video.videoWidth || 0, h = video.videoHeight || 0;
+        if (w > 0 && h > 0) {
+          // clamp to sane limits (e.g., avoid extreme tall ratios)
+          const ratio = w / h;
+          const clamped = Math.max(0.9, Math.min(2.1, ratio)); // ~from 9:10 to ~21:10
+          stage.style.aspectRatio = `${clamped} / 1`;
         }
-      };
+      }
+      video.addEventListener("loadedmetadata", applyAdaptiveAR);
 
-      pc.oniceconnectionstatechange = () => {
-        if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
-          setStatus("connected");
-        } else if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
-          setStatus("ice " + pc.iceConnectionState);
-        }
-      };
+      // ---- WebRTC wiring with auto-reconnect ----
+      let pc = null;
+      let reconnectAttempts = 0;
+      const MAX_RETRIES = 3;
 
-      (async () => {
+      async function startOnce() {
+        // Build a fresh RTCPeerConnection
+        if (pc) { try { pc.close(); } catch {} pc = null; }
+        pc = new RTCPeerConnection(RTC_CONFIG);
+
+        // Ensure we request both tracks
         try {
-          setStatus("applying offer…");
-          await pc.setRemoteDescription({ type: "offer", sdp: OFFER_SDP });
+          pc.addTransceiver("audio", { direction: "recvonly" });
+          pc.addTransceiver("video", { direction: "recvonly" });
+        } catch {}
 
-          setStatus("creating answer…");
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
+        pc.ontrack = (ev) => {
+          const [stream] = ev.streams;
+          if (!stream) return;
+          if (ev.track.kind === "video") {
+            video.srcObject = stream;
+            video.muted = true;
+            video.play().catch(()=>{});
+            // If metadata already known, apply AR immediately
+            if (video.videoWidth && video.videoHeight) applyAdaptiveAR();
+          } else if (ev.track.kind === "audio") {
+            audio.srcObject = stream;
+            setTimeout(ensureAudio, 100);
+          }
+        };
 
-          await new Promise((resolve) => {
-            if (pc.iceGatheringState === "complete") return resolve();
-            const check = () => {
-              if (pc.iceGatheringState === "complete") {
-                pc.removeEventListener("icegatheringstatechange", check);
-                resolve();
+        pc.oniceconnectionstatechange = () => {
+          const s = pc.iceConnectionState;
+          if (s === "connected" || s === "completed") {
+            setStatus("connected");
+            reconnectAttempts = 0; // reset backoff after a good connection
+          } else if (s === "disconnected") {
+            setStatus("ice disconnected");
+            // soft wait; transient disconnects often recover without action
+            setTimeout(() => {
+              if (pc && (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed")) {
+                triggerReconnect();
               }
-            };
-            pc.addEventListener("icegatheringstatechange", check);
-            setTimeout(resolve, 1500);
-          });
+            }, 1500);
+          } else if (s === "failed") {
+            setStatus("ice failed");
+            triggerReconnect();
+          }
+        };
 
-          setStatus("starting session…");
-          await fetch("https://api.heygen.com/v1/streaming.start", {
-            method: "POST",
-            headers: {
-              "Authorization": `Bearer ${SESSION_TOKEN}`,
-              "Content-Type": "application/json",
-              "accept": "application/json"
-            },
-            body: JSON.stringify({
-              session_id: SESSION_ID,
-              sdp: { type: "answer", sdp: pc.localDescription.sdp }
-            })
-          });
+        setStatus("applying offer…");
+        await pc.setRemoteDescription({ type: "offer", sdp: OFFER_SDP });
 
-          setStatus("waiting for media…");
-          gate.style.display = "flex";
+        setStatus("creating answer…");
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
 
-        } catch (err) {
-          setStatus("init error");
-          console.error(err);
+        // Wait for ICE gathering to finish or timeout
+        await new Promise((resolve) => {
+          if (pc.iceGatheringState === "complete") return resolve();
+          const check = () => {
+            if (pc.iceGatheringState === "complete") {
+              pc.removeEventListener("icegatheringstatechange", check);
+              resolve();
+            }
+          };
+          pc.addEventListener("icegatheringstatechange", check);
+          setTimeout(resolve, 1500);
+        });
+
+        setStatus("starting session…");
+        await fetch("https://api.heygen.com/v1/streaming.start", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${SESSION_TOKEN}`,
+            "Content-Type": "application/json",
+            "accept": "application/json"
+          },
+          body: JSON.stringify({
+            session_id: SESSION_ID,
+            sdp: { type: "answer", sdp: pc.localDescription.sdp }
+          })
+        });
+
+        setStatus("waiting for media…");
+        gate.style.display = "flex";
+      }
+
+      async function triggerReconnect() {
+        if (reconnectAttempts >= MAX_RETRIES) {
+          setStatus("reconnect limit reached — use Start/Restart");
+          return;
         }
+        reconnectAttempts++;
+        const delay = 500 * reconnectAttempts; // simple backoff
+        setStatus(`reconnecting (${reconnectAttempts}/${MAX_RETRIES})…`);
+        try {
+          // small pause helps on mobile networks
+          await new Promise(r => setTimeout(r, delay));
+          await startOnce();
+        } catch (e) {
+          console.error("reconnect error", e);
+          // try again soon if we still have attempts
+          if (reconnectAttempts < MAX_RETRIES) {
+            setTimeout(triggerReconnect, 800);
+          } else {
+            setStatus("reconnect failed — use Start/Restart");
+          }
+        }
+      }
+
+      // Kickoff
+      (async () => {
+        try { await startOnce(); }
+        catch (err) { setStatus("init error"); console.error(err); }
       })();
     </script>
   </body>
