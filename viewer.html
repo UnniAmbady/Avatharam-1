@@ -1,124 +1,152 @@
 <!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta http-equiv="Content-Security-Policy"
-        content="default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;">
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-  <title>HeyGen Viewer — Step</title>
-  <style>
-    :root { --bg:#0b0e11; --panel:#111827; --line:#374151; --text:#e5e7eb; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; }
-    html,body { margin:0; padding:0; background:var(--bg); height:100%; overflow-x:hidden; }
-    .bar { position:sticky; top:0; background:#0f172a; padding:8px 12px; border-bottom:1px solid #334155; font:12px; color:#cbd5e1; }
-    .wrap { display:flex; align-items:center; justify-content:center; min-height:72vh; }
-    video { width:100%; height:auto; max-height:64vh; background:#000; border-radius:14px; }
-    .drawer { position:fixed; left:0; right:0; bottom:-42vh; height:42vh; background:var(--panel); border-top:1px solid var(--line); transition:bottom .25s ease; }
-    .drawer.open { bottom:0; }
-    .handle { position:absolute; top:-28px; left:0; right:0; margin:auto; width:120px; height:24px;
-              background:#0f172a; border:1px solid #334155; border-bottom:none; border-radius:10px 10px 0 0;
-              color:#cbd5e1; font:12px; display:flex; align-items:center; justify-content:center; cursor:pointer; }
-    .log { padding:10px 12px; white-space:pre-wrap; font:12px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial; color:var(--text); height:100%; overflow:auto; }
-    .ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)}
-  </style>
-</head>
-<body>
-  <div class="bar" id="bar">Idle. Use the phase buttons above.</div>
-  <div class="wrap"><video id="v" playsinline autoplay muted></video></div>
-
-  <div class="drawer" id="drawer">
-    <div class="handle" id="handle">Diagnostics</div>
-    <div id="log" class="log">Boot.</div>
-  </div>
-
-<script>
-  // Slide drawer
-  (function(){ const d=document.getElementById('drawer'), h=document.getElementById('handle'); h.onclick=()=>d.classList.toggle('open'); })();
-  const bar = document.getElementById("bar");
-  const logEl = document.getElementById("log");
-  function setBar(t){ bar.textContent=t; }
-  function log(t,cls){ const x=document.createElement("div"); if(cls) x.className=cls; x.textContent=t; logEl.appendChild(x); console.log(t); }
-
-  window.onerror=(m,src,l,c,e)=>log(`onerror: ${m} @ ${src}:${l}:${c} ${e?(" | "+e.stack):""}`,"err");
-  window.addEventListener("unhandledrejection",ev=>log("unhandledrejection: "+(ev.reason&&ev.reason.stack?ev.reason.stack:ev.reason),"err"));
-  log("JS loaded","ok");
-
-  // Placeholders from Streamlit
-  const SESSION_TOKEN   = "__SESSION_TOKEN__";
-  const SESSION_ID      = "__SESSION_ID__";
-  const OFFER_SDP_B64   = "__OFFER_SDP_B64__";
-  const RTC_CONFIG      = __RTC_CONFIG_LITERAL__;
-  const API_BASE        = "__API_BASE__";
-  const PROXY_BASE      = "__PROXY_BASE__"; // e.g. https://your-worker/proxy?url=
-  const PHASE           = "__PHASE__";
-  log("placeholders parsed: PHASE="+PHASE,"ok");
-
-  // Build target URL (proxy if provided)
-  function target(url){
-    if (PROXY_BASE && PROXY_BASE.length>0) return PROXY_BASE + encodeURIComponent(url);
-    return url;
-  }
-
-  async function post_bearer_json(answer) {
-    const url = target(API_BASE + "/streaming.sdp");
-    const headers = { "accept":"application/json", "content-type":"application/json", "authorization":"Bearer "+SESSION_TOKEN };
-    log("POST "+url+" (Bearer JSON)");
-    return fetch(url,{method:"POST",headers,body:JSON.stringify({session_id:SESSION_ID, sdp:answer})});
-  }
-  async function post_token_query_text(answer) {
-    const real = API_BASE + "/streaming.sdp?access_token="+encodeURIComponent(SESSION_TOKEN)+"&session_id="+encodeURIComponent(SESSION_ID);
-    const url  = target(real);
-    const headers = { "content-type":"text/plain" };
-    log("POST "+url+" (text/plain + token in query)");
-    return fetch(url,{method:"POST",headers,body:answer});
-  }
-  async function post_no_cors(answer) {
-    const real = API_BASE + "/streaming.sdp?access_token="+encodeURIComponent(SESSION_TOKEN)+"&session_id="+encodeURIComponent(SESSION_ID);
-    const url  = target(real);
-    log("POST "+url+" (no-cors)");
-    return fetch(url,{method:"POST",mode:"no-cors",body:answer});
-  }
-
-  async function doSDP(kind){
-    try{
-      const offer = atob(OFFER_SDP_B64 || "");
-      if(!offer){ setBar("No offer SDP. Run 1) New in app."); return; }
-      const pc = new RTCPeerConnection(RTC_CONFIG || {});
-      pc.addEventListener("track",(ev)=>{ if(ev.streams && ev.streams[0]){ v.srcObject=ev.streams[0]; log("Track received","ok"); }});
-      pc.addEventListener("iceconnectionstatechange",()=>log("ice="+pc.iceConnectionState));
-      pc.addEventListener("connectionstatechange",()=>log("conn="+pc.connectionState));
-
-      pc.addTransceiver("audio",{direction:"recvonly"});
-      pc.addTransceiver("video",{direction:"recvonly"});
-      await pc.setRemoteDescription({type:"offer", sdp:offer});
-      log("Remote offer set","ok");
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      log("Local answer created","ok");
-
-      let r;
-      if(kind==="bearer"){
-        r = await post_bearer_json(pc.localDescription.sdp);
-        if (r.type==="opaque") log("bearer -> opaque (proxied/no-cors)","warn"); else log("bearer -> "+r.status+" "+(r.statusText||""), r.ok?"ok":"warn");
-      } else if(kind==="plain"){
-        r = await post_token_query_text(pc.localDescription.sdp);
-        if (r.type==="opaque") log("text/plain -> opaque (proxied/no-cors)","warn"); else log("plain -> "+r.status+" "+(r.statusText||""), r.ok?"ok":"warn");
-      } else {
-        await post_no_cors(pc.localDescription.sdp);
-        log("no-cors sent; watching ICE…","warn");
+<html>
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+    <title>AI Avatar Viewer (Direct WebRTC + Audio)</title>
+    <style>
+      html,body{margin:0;padding:0;height:100%;width:100%;background:#0b0b0c;color:#eaeaea;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+      .wrap{display:flex;flex-direction:column;gap:10px;width:100%;height:100%;align-items:center;justify-content:flex-start}
+      .title{font-size:16px;text-align:center;margin-top:6px;opacity:.9}
+      .stage{position:relative;width:100%;max-width:420px;aspect-ratio:9/16;background:#111;border-radius:18px;overflow:hidden;border:1px solid #222;display:grid;place-items:center}
+      video{width:100%;height:100%;object-fit:cover;display:block}
+      .status{font-size:12px;opacity:.85}
+      .overlay{
+        position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+        background:rgba(0,0,0,0.35); backdrop-filter:saturate(1.1) blur(1px);
       }
-      setBar("Waiting for media…");
-    } catch (e){
-      log("Viewer error: "+(e && e.message ? e.message : e),"err");
-      setBar("Viewer error. See diagnostics.");
-    }
-  }
+      .overlay button{
+        border:none; border-radius:999px; padding:14px 18px; font-size:14px; cursor:pointer;
+        box-shadow:0 8px 22px rgba(0,0,0,.35);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="title">Avatar: <span id="aname"></span></div>
+      <div class="stage">
+        <!-- Video shows picture only; audio routed to dedicated <audio> element -->
+        <video id="video" playsinline autoplay muted></video>
+        <div class="overlay" id="audioGate" style="display:flex">
+          <button id="enableBtn">🔊 Tap to enable sound</button>
+        </div>
+      </div>
+      <div class="status" id="status">initializing…</div>
+    </div>
 
-  const v = document.getElementById("v"); v.muted = true;
-  if (PHASE==="sdp_bearer") { setBar("SDP: Bearer");   doSDP("bearer"); }
-  if (PHASE==="sdp_plain")  { setBar("SDP: text/plain"); doSDP("plain"); }
-  if (PHASE==="sdp_nocors") { setBar("SDP: no-cors");  doSDP("nocors"); }
-  if (PHASE==="render")     { setBar("Viewer ready. Choose 4A/4B/4C."); }
-</script>
-</body>
+    <audio id="audio" autoplay></audio>
+
+    <script>
+      // Injected by Streamlit
+      const SESSION_TOKEN = "__SESSION_TOKEN__";
+      const AVATAR_NAME   = "__AVATAR_NAME__";
+      const SESSION_ID    = "__SESSION_ID__";
+      const OFFER_SDP     = "__OFFER_SDP__";          // raw text from API
+      const RTC_CONFIG    = __RTC_CONFIG__ || {};     // {"iceServers":[...]}
+      document.getElementById("aname").textContent = AVATAR_NAME;
+
+      const statusEl = document.getElementById("status");
+      const setStatus = (t)=> statusEl.textContent = t;
+
+      // ---- DIRECT WEBRTC (no SDK) ----
+      const pc = new RTCPeerConnection(RTC_CONFIG);
+
+      // Explicitly receive both audio and video
+      try {
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+        pc.addTransceiver('video', { direction: 'recvonly' });
+      } catch {}
+
+      const video = document.getElementById("video");
+      const audio = document.getElementById("audio");
+      const gate  = document.getElementById("audioGate");
+      const btn   = document.getElementById("enableBtn");
+
+      async function ensureAudio() {
+        try {
+          audio.muted = false;
+          audio.volume = 1.0;
+          await audio.play();
+          gate.style.display = "none";
+        } catch {
+          gate.style.display = "flex";
+        }
+      }
+
+      btn.addEventListener('click', async () => {
+        try {
+          audio.muted = false;
+          audio.volume = 1.0;
+          await audio.play();
+          gate.style.display = "none";
+        } catch {}
+      });
+
+      pc.ontrack = (ev) => {
+        const [stream] = ev.streams;
+        if (!stream) return;
+        if (ev.track.kind === 'video') {
+          video.srcObject = stream;
+          video.muted = true;           // picture only
+          video.play().catch(()=>{});
+        } else if (ev.track.kind === 'audio') {
+          audio.srcObject = stream;     // sound goes here
+          setTimeout(ensureAudio, 100);
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+          setStatus("connected");
+        } else if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
+          setStatus("ice " + pc.iceConnectionState);
+        }
+      };
+
+      (async () => {
+        try {
+          setStatus("applying offer…");
+          await pc.setRemoteDescription({ type: "offer", sdp: OFFER_SDP });
+
+          setStatus("creating answer…");
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+
+          // Wait for ICE to finish gathering local candidates (same timing as your working file)
+          await new Promise((resolve) => {
+            if (pc.iceGatheringState === "complete") return resolve();
+            const check = () => {
+              if (pc.iceGatheringState === "complete") {
+                pc.removeEventListener("icegatheringstatechange", check);
+                resolve();
+              }
+            };
+            pc.addEventListener("icegatheringstatechange", check);
+            setTimeout(resolve, 1500);
+          });
+
+          setStatus("starting session…");
+          await fetch("https://api.heygen.com/v1/streaming.start", {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${SESSION_TOKEN}`,
+              "Content-Type": "application/json",
+              "accept": "application/json"
+            },
+            body: JSON.stringify({
+              session_id: SESSION_ID,
+              sdp: { type: "answer", sdp: pc.localDescription.sdp }
+            })
+          });
+
+          setStatus("waiting for media…");
+          gate.style.display = "flex";  // show until audio is allowed
+
+        } catch (err) {
+          setStatus("init error");
+          console.error(err);
+        }
+      })();
+    </script>
+  </body>
 </html>
