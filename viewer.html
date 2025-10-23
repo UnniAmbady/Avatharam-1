@@ -7,7 +7,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
   <title>HeyGen Viewer — Step</title>
   <style>
-    :root { --bg:#0b0e11; --panel:#111827; --line:#374151; --text:#e5e7eb; --muted:#94a3b8; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; }
+    :root { --bg:#0b0e11; --panel:#111827; --line:#374151; --text:#e5e7eb; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; }
     html,body { margin:0; padding:0; background:var(--bg); height:100%; overflow-x:hidden; }
     .bar { position:sticky; top:0; background:#0f172a; padding:8px 12px; border-bottom:1px solid #334155; font:12px; color:#cbd5e1; }
     .wrap { display:flex; align-items:center; justify-content:center; min-height:72vh; }
@@ -22,7 +22,7 @@
   </style>
 </head>
 <body>
-  <div class="bar" id="bar">Idle. Click phases above (in the app).</div>
+  <div class="bar" id="bar">Idle. Use the phase buttons above.</div>
   <div class="wrap"><video id="v" playsinline autoplay muted></video></div>
 
   <div class="drawer" id="drawer">
@@ -31,60 +31,64 @@
   </div>
 
 <script>
-  // slide drawer
+  // Slide drawer
   (function(){ const d=document.getElementById('drawer'), h=document.getElementById('handle'); h.onclick=()=>d.classList.toggle('open'); })();
-
   const bar = document.getElementById("bar");
   const logEl = document.getElementById("log");
   function setBar(t){ bar.textContent=t; }
   function log(t,cls){ const x=document.createElement("div"); if(cls) x.className=cls; x.textContent=t; logEl.appendChild(x); console.log(t); }
 
-  // early error taps
   window.onerror=(m,src,l,c,e)=>log(`onerror: ${m} @ ${src}:${l}:${c} ${e?(" | "+e.stack):""}`,"err");
   window.addEventListener("unhandledrejection",ev=>log("unhandledrejection: "+(ev.reason&&ev.reason.stack?ev.reason.stack:ev.reason),"err"));
   log("JS loaded","ok");
 
-  // placeholders from Python
+  // Placeholders from Streamlit
   const SESSION_TOKEN   = "__SESSION_TOKEN__";
   const SESSION_ID      = "__SESSION_ID__";
   const OFFER_SDP_B64   = "__OFFER_SDP_B64__";
   const RTC_CONFIG      = __RTC_CONFIG_LITERAL__;
   const API_BASE        = "__API_BASE__";
+  const PROXY_BASE      = "__PROXY_BASE__"; // e.g. https://your-worker/proxy?url=
   const PHASE           = "__PHASE__";
-
   log("placeholders parsed: PHASE="+PHASE,"ok");
 
-  // helpers
+  // Build target URL (proxy if provided)
+  function target(url){
+    if (PROXY_BASE && PROXY_BASE.length>0) return PROXY_BASE + encodeURIComponent(url);
+    return url;
+  }
+
   async function post_bearer_json(answer) {
-    const url = API_BASE + "/streaming.sdp";
+    const url = target(API_BASE + "/streaming.sdp");
     const headers = { "accept":"application/json", "content-type":"application/json", "authorization":"Bearer "+SESSION_TOKEN };
     log("POST "+url+" (Bearer JSON)");
     return fetch(url,{method:"POST",headers,body:JSON.stringify({session_id:SESSION_ID, sdp:answer})});
   }
   async function post_token_query_text(answer) {
-    const url = API_BASE + "/streaming.sdp?access_token="+encodeURIComponent(SESSION_TOKEN)+"&session_id="+encodeURIComponent(SESSION_ID);
+    const real = API_BASE + "/streaming.sdp?access_token="+encodeURIComponent(SESSION_TOKEN)+"&session_id="+encodeURIComponent(SESSION_ID);
+    const url  = target(real);
     const headers = { "content-type":"text/plain" };
     log("POST "+url+" (text/plain + token in query)");
     return fetch(url,{method:"POST",headers,body:answer});
   }
   async function post_no_cors(answer) {
-    const url = API_BASE + "/streaming.sdp?access_token="+encodeURIComponent(SESSION_TOKEN)+"&session_id="+encodeURIComponent(SESSION_ID);
-    log("POST "+url+" (no-cors fallback)");
+    const real = API_BASE + "/streaming.sdp?access_token="+encodeURIComponent(SESSION_TOKEN)+"&session_id="+encodeURIComponent(SESSION_ID);
+    const url  = target(real);
+    log("POST "+url+" (no-cors)");
     return fetch(url,{method:"POST",mode:"no-cors",body:answer});
   }
 
   async function doSDP(kind){
     try{
       const offer = atob(OFFER_SDP_B64 || "");
-      if(!offer){ setBar("No offer SDP yet. Run 1) New in app."); return; }
+      if(!offer){ setBar("No offer SDP. Run 1) New in app."); return; }
       const pc = new RTCPeerConnection(RTC_CONFIG || {});
-      pc.addEventListener("track", (ev)=>{ if(ev.streams && ev.streams[0]){ v.srcObject=ev.streams[0]; log("Track received","ok"); }});
-      pc.addEventListener("iceconnectionstatechange", ()=>log("ice="+pc.iceConnectionState));
-      pc.addEventListener("connectionstatechange", ()=>log("conn="+pc.connectionState));
+      pc.addEventListener("track",(ev)=>{ if(ev.streams && ev.streams[0]){ v.srcObject=ev.streams[0]; log("Track received","ok"); }});
+      pc.addEventListener("iceconnectionstatechange",()=>log("ice="+pc.iceConnectionState));
+      pc.addEventListener("connectionstatechange",()=>log("conn="+pc.connectionState));
 
       pc.addTransceiver("audio",{direction:"recvonly"});
       pc.addTransceiver("video",{direction:"recvonly"});
-
       await pc.setRemoteDescription({type:"offer", sdp:offer});
       log("Remote offer set","ok");
 
@@ -95,25 +99,26 @@
       let r;
       if(kind==="bearer"){
         r = await post_bearer_json(pc.localDescription.sdp);
-        log("SDP bearer -> "+r.status+" "+(r.statusText||""), r.ok?"ok":"warn");
-      }else if(kind==="plain"){
+        if (r.type==="opaque") log("bearer -> opaque (proxied/no-cors)","warn"); else log("bearer -> "+r.status+" "+(r.statusText||""), r.ok?"ok":"warn");
+      } else if(kind==="plain"){
         r = await post_token_query_text(pc.localDescription.sdp);
-        if (r.type==="opaque") log("text/plain -> opaque (likely delivered)","warn");
-        else log("SDP text/plain -> "+r.status+" "+(r.statusText||""), r.ok?"ok":"warn");
-      }else{
+        if (r.type==="opaque") log("text/plain -> opaque (proxied/no-cors)","warn"); else log("plain -> "+r.status+" "+(r.statusText||""), r.ok?"ok":"warn");
+      } else {
         await post_no_cors(pc.localDescription.sdp);
-        log("no-cors sent; waiting on ICE…","warn");
+        log("no-cors sent; watching ICE…","warn");
       }
       setBar("Waiting for media…");
-    }catch(e){ log("Viewer error: "+(e&&e.message?e.message:e),"err"); setBar("Viewer error. See diagnostics."); }
+    } catch (e){
+      log("Viewer error: "+(e && e.message ? e.message : e),"err");
+      setBar("Viewer error. See diagnostics.");
+    }
   }
 
-  // phase actions
   const v = document.getElementById("v"); v.muted = true;
-  if (PHASE==="sdp_bearer") { setBar("SDP: Bearer"); doSDP("bearer"); }
-  if (PHASE==="sdp_plain")  { setBar("SDP: text/plain"); doSDP("plain");  }
-  if (PHASE==="sdp_nocors") { setBar("SDP: no-cors");   doSDP("nocors");  }
-  if (PHASE==="render")     { setBar("Viewer ready. Choose an SDP method (4A/4B/4C)."); }
+  if (PHASE==="sdp_bearer") { setBar("SDP: Bearer");   doSDP("bearer"); }
+  if (PHASE==="sdp_plain")  { setBar("SDP: text/plain"); doSDP("plain"); }
+  if (PHASE==="sdp_nocors") { setBar("SDP: no-cors");  doSDP("nocors"); }
+  if (PHASE==="render")     { setBar("Viewer ready. Choose 4A/4B/4C."); }
 </script>
 </body>
 </html>
