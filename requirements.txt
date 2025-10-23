@@ -6,3 +6,10 @@ numpy==1.26.4
 av==12.2.0
 openai==1.43.0
 
+streamlit-mic-recorder==0.0.8
+faster-whisper==1.0.3
+vosk==0.3.45
+sounddevice>=0.4.6
+torchaudio>=2.3.0
+typing-extensions>=4.10.0
+
