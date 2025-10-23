@@ -5,93 +5,115 @@
   <meta http-equiv="Content-Security-Policy"
         content="default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-  <title>HeyGen Viewer (diag2)</title>
+  <title>HeyGen Viewer — Step</title>
   <style>
-    html,body { margin:0; padding:0; background:#0b0e11; height:100%; }
-    .wrap { display:flex; align-items:center; justify-content:center; min-height:80vh; }
-    video { width:100%; height:auto; max-height:70vh; background:#000; border-radius:14px; }
-    .log { font:12px/1.45 system-ui, -apple-system, Segoe UI, Roboto, Arial; color:#e5e7eb;
-           background:#111827; border-top:1px solid #374151; padding:10px 12px; white-space:pre-wrap; }
-    .ok { color:#22c55e } .warn { color:#f59e0b } .err { color:#ef4444 }
-    .bar { position:sticky; top:0; background:#0f172a; padding:6px 10px; border-bottom:1px solid #334155; font:12px; color:#cbd5e1; }
+    :root { --bg:#0b0e11; --panel:#111827; --line:#374151; --text:#e5e7eb; --muted:#94a3b8; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; }
+    html,body { margin:0; padding:0; background:var(--bg); height:100%; overflow-x:hidden; }
+    .bar { position:sticky; top:0; background:#0f172a; padding:8px 12px; border-bottom:1px solid #334155; font:12px; color:#cbd5e1; }
+    .wrap { display:flex; align-items:center; justify-content:center; min-height:72vh; }
+    video { width:100%; height:auto; max-height:64vh; background:#000; border-radius:14px; }
+    .drawer { position:fixed; left:0; right:0; bottom:-42vh; height:42vh; background:var(--panel); border-top:1px solid var(--line); transition:bottom .25s ease; }
+    .drawer.open { bottom:0; }
+    .handle { position:absolute; top:-28px; left:0; right:0; margin:auto; width:120px; height:24px;
+              background:#0f172a; border:1px solid #334155; border-bottom:none; border-radius:10px 10px 0 0;
+              color:#cbd5e1; font:12px; display:flex; align-items:center; justify-content:center; cursor:pointer; }
+    .log { padding:10px 12px; white-space:pre-wrap; font:12px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial; color:var(--text); height:100%; overflow:auto; }
+    .ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)}
   </style>
 </head>
 <body>
-  <div class="bar">Connecting to session…</div>
+  <div class="bar" id="bar">Idle. Click phases above (in the app).</div>
   <div class="wrap"><video id="v" playsinline autoplay muted></video></div>
-  <div id="log" class="log">Boot.</div>
+
+  <div class="drawer" id="drawer">
+    <div class="handle" id="handle">Diagnostics</div>
+    <div id="log" class="log">Boot.</div>
+  </div>
 
 <script>
-  // ---- Ultra-early error taps
+  // slide drawer
+  (function(){ const d=document.getElementById('drawer'), h=document.getElementById('handle'); h.onclick=()=>d.classList.toggle('open'); })();
+
+  const bar = document.getElementById("bar");
   const logEl = document.getElementById("log");
-  function log(t, cls){ const d=document.createElement("div"); if(cls) d.className=cls; d.textContent=t; logEl.appendChild(d); console.log(t); }
-  function setBar(t){ const b=document.querySelector(".bar"); if(b) b.textContent=t; }
-  window.onerror = function(msg, src, line, col, err){ log("onerror: " + msg + " @ " + src + ":" + line + ":" + col + (err?(" | " + err.stack):""), "err"); }
-  window.addEventListener("unhandledrejection", ev => { log("unhandledrejection: " + (ev.reason && ev.reason.stack ? ev.reason.stack : ev.reason), "err"); });
+  function setBar(t){ bar.textContent=t; }
+  function log(t,cls){ const x=document.createElement("div"); if(cls) x.className=cls; x.textContent=t; logEl.appendChild(x); console.log(t); }
 
-  log("JS loaded", "ok");
+  // early error taps
+  window.onerror=(m,src,l,c,e)=>log(`onerror: ${m} @ ${src}:${l}:${c} ${e?(" | "+e.stack):""}`,"err");
+  window.addEventListener("unhandledrejection",ev=>log("unhandledrejection: "+(ev.reason&&ev.reason.stack?ev.reason.stack:ev.reason),"err"));
+  log("JS loaded","ok");
 
-  // ---- Placeholders from Python
+  // placeholders from Python
   const SESSION_TOKEN   = "__SESSION_TOKEN__";
   const SESSION_ID      = "__SESSION_ID__";
   const OFFER_SDP_B64   = "__OFFER_SDP_B64__";
-  const RTC_CONFIG      = __RTC_CONFIG_LITERAL__;  // inserted as raw JSON literal
+  const RTC_CONFIG      = __RTC_CONFIG_LITERAL__;
   const API_BASE        = "__API_BASE__";
+  const PHASE           = "__PHASE__";
 
-  log("placeholders parsed", "ok");
+  log("placeholders parsed: PHASE="+PHASE,"ok");
 
-  async function postSDP(answerSDP, useBearer=true){
+  // helpers
+  async function post_bearer_json(answer) {
     const url = API_BASE + "/streaming.sdp";
-    const headers = { "Content-Type": "application/json", "accept": "application/json" };
-    if(useBearer){ headers["Authorization"] = "Bearer " + SESSION_TOKEN; }
-    else         { headers["x-api-key"]     = SESSION_TOKEN; } // fallback try
-
-    const body = { session_id: SESSION_ID, sdp: answerSDP };
-    log("POST " + url + " " + (useBearer ? "(Bearer)" : "(x-api-key)"));
-    const r = await fetch(url, { method:"POST", headers, body: JSON.stringify(body) });
-    const txt = await r.text();
-    log("SDP status=" + r.status + " body=" + txt.slice(0,240) + (txt.length>240?"…":"") , r.ok?"ok":"err");
-    return r.ok;
+    const headers = { "accept":"application/json", "content-type":"application/json", "authorization":"Bearer "+SESSION_TOKEN };
+    log("POST "+url+" (Bearer JSON)");
+    return fetch(url,{method:"POST",headers,body:JSON.stringify({session_id:SESSION_ID, sdp:answer})});
+  }
+  async function post_token_query_text(answer) {
+    const url = API_BASE + "/streaming.sdp?access_token="+encodeURIComponent(SESSION_TOKEN)+"&session_id="+encodeURIComponent(SESSION_ID);
+    const headers = { "content-type":"text/plain" };
+    log("POST "+url+" (text/plain + token in query)");
+    return fetch(url,{method:"POST",headers,body:answer});
+  }
+  async function post_no_cors(answer) {
+    const url = API_BASE + "/streaming.sdp?access_token="+encodeURIComponent(SESSION_TOKEN)+"&session_id="+encodeURIComponent(SESSION_ID);
+    log("POST "+url+" (no-cors fallback)");
+    return fetch(url,{method:"POST",mode:"no-cors",body:answer});
   }
 
-  async function main(){
+  async function doSDP(kind){
     try{
-      const offerSDP = atob(OFFER_SDP_B64);
-      log("RTC config=" + JSON.stringify(RTC_CONFIG));
+      const offer = atob(OFFER_SDP_B64 || "");
+      if(!offer){ setBar("No offer SDP yet. Run 1) New in app."); return; }
       const pc = new RTCPeerConnection(RTC_CONFIG || {});
-      pc.addEventListener("connectionstatechange", ()=>log("pc.connectionState="+pc.connectionState));
-      pc.addEventListener("iceconnectionstatechange", ()=>log("pc.iceConnectionState="+pc.iceConnectionState));
-      pc.addEventListener("signalingstatechange", ()=>log("pc.signalingState="+pc.signalingState));
-      pc.addEventListener("track", (ev) => {
-        const v = document.getElementById("v");
-        if (ev.streams && ev.streams[0]) { v.srcObject = ev.streams[0]; log("Track received", "ok"); setBar("Connected."); }
-      });
+      pc.addEventListener("track", (ev)=>{ if(ev.streams && ev.streams[0]){ v.srcObject=ev.streams[0]; log("Track received","ok"); }});
+      pc.addEventListener("iceconnectionstatechange", ()=>log("ice="+pc.iceConnectionState));
+      pc.addEventListener("connectionstatechange", ()=>log("conn="+pc.connectionState));
 
-      pc.addTransceiver("audio", { direction: "recvonly" });
-      pc.addTransceiver("video", { direction: "recvonly" });
+      pc.addTransceiver("audio",{direction:"recvonly"});
+      pc.addTransceiver("video",{direction:"recvonly"});
 
-      await pc.setRemoteDescription({ type:"offer", sdp: offerSDP });
-      log("Remote offer set", "ok"); setBar("Creating local answer…");
+      await pc.setRemoteDescription({type:"offer", sdp:offer});
+      log("Remote offer set","ok");
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      log("Local answer created", "ok"); setBar("Submitting SDP to server…");
+      log("Local answer created","ok");
 
-      let ok = await postSDP(pc.localDescription.sdp, true);
-      if(!ok){ log("Bearer attempt failed, trying x-api-key fallback…", "warn"); ok = await postSDP(pc.localDescription.sdp, false); }
-      if(!ok){ setBar("SDP submit failed. See logs below."); return; }
-
+      let r;
+      if(kind==="bearer"){
+        r = await post_bearer_json(pc.localDescription.sdp);
+        log("SDP bearer -> "+r.status+" "+(r.statusText||""), r.ok?"ok":"warn");
+      }else if(kind==="plain"){
+        r = await post_token_query_text(pc.localDescription.sdp);
+        if (r.type==="opaque") log("text/plain -> opaque (likely delivered)","warn");
+        else log("SDP text/plain -> "+r.status+" "+(r.statusText||""), r.ok?"ok":"warn");
+      }else{
+        await post_no_cors(pc.localDescription.sdp);
+        log("no-cors sent; waiting on ICE…","warn");
+      }
       setBar("Waiting for media…");
-
-    } catch (e){
-      log("Viewer error: " + (e && e.message ? e.message : e), "err");
-      setBar("Viewer error. See logs below.");
-    }
+    }catch(e){ log("Viewer error: "+(e&&e.message?e.message:e),"err"); setBar("Viewer error. See diagnostics."); }
   }
 
-  const v = document.getElementById("v");
-  v.muted = true; // iOS-safe autoplay
-  main();
+  // phase actions
+  const v = document.getElementById("v"); v.muted = true;
+  if (PHASE==="sdp_bearer") { setBar("SDP: Bearer"); doSDP("bearer"); }
+  if (PHASE==="sdp_plain")  { setBar("SDP: text/plain"); doSDP("plain");  }
+  if (PHASE==="sdp_nocors") { setBar("SDP: no-cors");   doSDP("nocors");  }
+  if (PHASE==="render")     { setBar("Viewer ready. Choose an SDP method (4A/4B/4C)."); }
 </script>
 </body>
 </html>
