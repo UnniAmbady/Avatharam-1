@@ -1,4 +1,4 @@
-# ver-10.3
+# ver-10.3.1
 # HeyGen — Stage.2.Ver.7 base + Voice Echo (Start/Stop) + Debug box
 # Flow: streaming.new -> streaming.create_token -> sleep(1s) -> viewer.start
 # Changes vs 10.2: Voice now records continuously; on Stop -> transcribe once -> print -> echo.
@@ -380,23 +380,29 @@ if _HAS_WEBRTC and ss.voice_run and ss.session_id and ss.session_token:
                 self.total_samples = 0
             return pcm, secs
 
+    # place this near the other helper functions (around line 170, after send_echo)
+    
     def transcribe_whisper(pcm_bytes: bytes, rate: int) -> Optional[str]:
         if not OPENAI_API_KEY or not pcm_bytes:
             return None
         try:
             from openai import OpenAI
+            import tempfile, wave
             client = OpenAI(api_key=OPENAI_API_KEY)
-            # write temporary wav
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 path = tmp.name
             with wave.open(path, "wb") as w:
-                w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(pcm_bytes)
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(rate)
+                w.writeframes(pcm_bytes)
             with open(path, "rb") as f:
                 resp = client.audio.transcriptions.create(model="whisper-1", file=f)
             return (getattr(resp, "text", "") or "").strip() or None
         except Exception as e:
             debug(f"[whisper] {e}")
             return None
+
 
     # create a new recorder for this run, mount webrtc
     rec = EchoRecorder()
