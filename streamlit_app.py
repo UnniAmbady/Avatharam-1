@@ -1,7 +1,7 @@
-#ver-10.2
+# ver-10.3
 # HeyGen — Stage.2.Ver.7 base + Voice Echo (Start/Stop) + Debug box
-# Sequence: streaming.new -> streaming.create_token -> sleep(1s) -> viewer.start
-# UI aligned with your working app (title, Start/Restart, Stop, Test-1).
+# Flow: streaming.new -> streaming.create_token -> sleep(1s) -> viewer.start
+# Changes vs 10.2: Voice now records continuously; on Stop -> transcribe once -> print -> echo.
 
 import json
 import time
@@ -31,7 +31,7 @@ st.markdown("""
   .ctrl-row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
   .ctrl-row .stButton > button { height:40px; padding:0 12px; font-size:.9rem; border-radius:10px; }
   iframe { border:none; border-radius:16px; }
-  /* hide internal start of streamlit-webrtc to avoid the flashing red button */
+  /* hide internal start of streamlit-webrtc to avoid flashing red button */
   div.st-webrtc > div:has(button) { display:none !important; }
 </style>
 """, unsafe_allow_html=True)
@@ -79,9 +79,8 @@ ss = st.session_state
 ss.setdefault("debug_buf", [])
 def debug(msg: str):
     ss.debug_buf.append(str(msg))
-    # Trim to keep the box responsive
-    if len(ss.debug_buf) > 500:
-        ss.debug_buf[:] = ss.debug_buf[-500:]
+    if len(ss.debug_buf) > 800:
+        ss.debug_buf[:] = ss.debug_buf[-800:]
 
 # ------------- HTTP helpers --------------
 def _get(url, params=None):
@@ -276,28 +275,49 @@ with b1:
             send_echo(ss.session_id, ss.session_token,
                       "Hello. Welcome to the test demonstration.")
 
-# ----- Voice Start / Stop (Echo) with placeholder teardown -----
+# ----- Voice Start / Stop (Echo) — record until Stop, then transcribe once -----
 
 # where we mount the webrtc component
 if "webrtc_slot" not in st.session_state:
     st.session_state.webrtc_slot = st.empty()
 if "webrtc_ctx" not in st.session_state:
     st.session_state.webrtc_ctx = None
+if "voice_run" not in st.session_state:
+    st.session_state.voice_run = False
+if "voice_rec" not in st.session_state:
+    st.session_state.voice_rec = None  # recorder instance
 
 with b2:
     if st.button("Voice Start", use_container_width=True):
-        ss["voice_run"] = True
+        ss.voice_run = True
         debug("[voice] start requested")
 
 with b3:
     if st.button("Voice Stop", use_container_width=True):
-        ss["voice_run"] = False
-        # Remove the component from the page — this cleanly stops the stream
+        ss.voice_run = False
+        # finalize BEFORE tearing down the component
+        final_text = None
+        try:
+            if ss.voice_rec is not None:
+                pcm_bytes, secs = ss.voice_rec.finalize()
+                debug(f"[voice] captured ~{secs:.2f}s audio ({len(pcm_bytes)} bytes)")
+                final_text = transcribe_whisper(pcm_bytes, 16000)
+                if final_text:
+                    debug(f"[voice→text] {final_text}")
+                    if ss.session_id and ss.session_token:
+                        send_echo(ss.session_id, ss.session_token, final_text)
+                else:
+                    debug("[voice→text] (no text or Whisper unavailable)")
+        except Exception as e:
+            debug(f"[voice finalize] {e}")
+
+        # Remove the component from the page — cleanly stops the stream
         try:
             st.session_state.webrtc_slot.empty()
         except Exception:
             pass
         st.session_state.webrtc_ctx = None
+        st.session_state.voice_rec = None
         debug("[voice] stop requested")
 
 with b4:
@@ -310,58 +330,34 @@ with b4:
 with b5:
     st.write("")
 
-# ----------------- Voice Echo -----------------
-# Uses streamlit-webrtc to capture mic; simple pause-based chunking; Whisper (if key present).
-if _HAS_WEBRTC and ss.get("voice_run") and ss.session_id and ss.session_token:
+# ----------------- Voice Echo (record-until-stop) -----------------
+if _HAS_WEBRTC and ss.voice_run and ss.session_id and ss.session_token:
     import wave, tempfile
     from threading import Lock
 
-    class EchoProcessor(AudioProcessorBase):
+    class EchoRecorder(AudioProcessorBase):
         """
-        Accumulates PCM16; when ~800ms pause or 4s max buffer,
-        flush -> transcribe -> speak back via streaming.task (repeat).
+        Accumulates PCM16 at 16 kHz mono until Stop.
+        On finalize() returns (pcm_bytes, seconds).
         """
-        def __init__(self, speak_cb):
+        def __init__(self):
             self.sample_rate = 16000
             self.buf = bytearray()
-            self.last_activity = time.time()
             self.lock = Lock()
-            self.speak_cb = speak_cb
-
-        def _flush_if_needed(self, force=False):
-            now = time.time()
-            inactive = (now - self.last_activity) > 0.8  # pause
-            longbuf = len(self.buf) > (self.sample_rate * 2 * 4)  # 4s @16k, 16-bit
-            if force or (inactive and len(self.buf) > self.sample_rate * 2 * 0.8) or longbuf:
-                pcm = bytes(self.buf)
-                self.buf.clear()
-                text = transcribe_whisper(pcm, self.sample_rate)
-                if text:
-                    debug(f"[stt] {text}")
-                    try:
-                        self.speak_cb(text)
-                    except Exception as e:
-                        debug(f"[echo error] {e}")
+            self.total_samples = 0
 
         def recv_audio(self, frame):
             try:
                 pcm16 = frame.to_ndarray(format="s16")
-                # mono
                 if pcm16.ndim == 2 and pcm16.shape[0] > 1:
                     pcm16 = pcm16[0:1, :]
                 pcm16 = np.squeeze(pcm16).astype(np.int16)
                 in_rate = frame.sample_rate
 
-                # rudimentary VAD by RMS
-                rms = float(np.sqrt(np.mean((pcm16.astype(np.float32))**2)))
-                if rms > 200:  # voiced-ish
-                    self.last_activity = time.time()
-
                 # resample if needed
                 if in_rate != self.sample_rate:
                     dur = pcm16.shape[0] / in_rate
                     new_len = int(dur * self.sample_rate)
-                    # numpy.interp over sample index
                     pcm16 = np.interp(
                         np.linspace(0, pcm16.shape[0] - 1, new_len),
                         np.arange(pcm16.shape[0]),
@@ -370,18 +366,19 @@ if _HAS_WEBRTC and ss.get("voice_run") and ss.session_id and ss.session_token:
 
                 with self.lock:
                     self.buf += pcm16.tobytes()
-                    self._flush_if_needed(force=False)
+                    self.total_samples += len(pcm16)
             except Exception as e:
                 debug(f"[audio] {e}")
             return frame
 
-        def destroy(self):
-            # final flush
-            try:
-                with self.lock:
-                    self._flush_if_needed(force=True)
-            except Exception:
-                pass
+        def finalize(self):
+            # return and clear buffer
+            with self.lock:
+                pcm = bytes(self.buf)
+                secs = self.total_samples / float(self.sample_rate) if self.sample_rate else 0.0
+                self.buf.clear()
+                self.total_samples = 0
+            return pcm, secs
 
     def transcribe_whisper(pcm_bytes: bytes, rate: int) -> Optional[str]:
         if not OPENAI_API_KEY or not pcm_bytes:
@@ -401,23 +398,18 @@ if _HAS_WEBRTC and ss.get("voice_run") and ss.session_id and ss.session_token:
             debug(f"[whisper] {e}")
             return None
 
-    def speak_back(text: str):
-        # call HeyGen repeat task
-        send_echo(ss.session_id, ss.session_token, text)
-
-    # bind a processor instance (avoid referencing session_state inside worker thread)
-    processor_instance = EchoProcessor(speak_back)
-
-    # Mount inside the placeholder; store context if you want to inspect it
+    # create a new recorder for this run, mount webrtc
+    rec = EchoRecorder()
+    ss.voice_rec = rec
     with st.session_state.webrtc_slot.container():
         st.session_state.webrtc_ctx = webrtc_streamer(
             key="mic-echo",
             mode=WebRtcMode.SENDONLY,
-            audio_processor_factory=lambda: processor_instance,
+            audio_processor_factory=lambda: rec,
             media_stream_constraints={"audio": True, "video": False},
             async_processing=False,
         )
-    st.caption("Voice echo is running…")
+    st.caption("Voice echo is recording… Speak, then press Voice Stop.")
 
 # -------------- Debug box (disabled) --------------
-st.text_area("Debug", value="\n".join(ss.debug_buf), height=200, disabled=True)
+st.text_area("Debug", value="\n".join(ss.debug_buf), height=220, disabled=True)
