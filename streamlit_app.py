@@ -36,7 +36,7 @@ except Exception:
 # ---------------- Page ----------------
 st.set_page_config(page_title="AI Avatar Demo", layout="centered")
 # (1) Title replaced with plain text (to avoid cut-off)
-st.text("AI Avatar Chat")
+st.text("\n\nAI Avatar Chat")
 
 st.markdown("""
 <style>
