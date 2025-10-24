@@ -1,4 +1,4 @@
-# ver-11.2
+# ver-12 (patched for fixed avatar + Start row)
 # HeyGen avatar + mic_recorder + (optional) faster-whisper
 # Fixes:
 # - Viewer video no longer cropped (paired viewer.html uses object-fit: contain).
@@ -35,7 +35,8 @@ except Exception:
 
 # ---------------- Page ----------------
 st.set_page_config(page_title="AI Avatar Demo", layout="centered")
-st.title("AI Avatar Demo")
+# (1) Title replaced with plain text (to avoid cut-off)
+st.text("AI Avatar Chat")
 
 st.markdown("""
 <style>
@@ -111,38 +112,16 @@ def _post_bearer(url, token, payload=None):
     if r.status_code >= 400: debug(raw); r.raise_for_status()
     return r.status_code, body, raw
 
-# --------- Avatars (ACTIVE only) ---------
-@st.cache_data(ttl=300)
-def fetch_interactive_avatars():
-    _, body, _ = _get(API_LIST_AVATARS)
-    items = []
-    for a in (body.get("data") or []):
-        if isinstance(a, dict) and a.get("status") == "ACTIVE":
-            items.append({
-                "label": a.get("pose_name") or a.get("avatar_id"),
-                "avatar_id": a.get("avatar_id"),
-                "default_voice": a.get("default_voice"),
-            })
-    seen, out = set(), []
-    for it in items:
-        aid = it.get("avatar_id")
-        if aid and aid not in seen:
-            seen.add(aid); out.append(it)
-    return out
-
-avatars = fetch_interactive_avatars()
-if not avatars:
-    st.error("No ACTIVE interactive avatars returned by HeyGen.")
-    st.stop()
-
-# Default to Alessandra if present
-default_idx = 0
-for i, a in enumerate(avatars):
-    if a["avatar_id"] == "Alessandra_CasualLook_public":
-        default_idx = i; break
-
-choice = st.selectbox("Choose an avatar", [a["label"] for a in avatars], index=default_idx)
-selected = next(a for a in avatars if a["label"] == choice)
+# ---------- (2) Fixed avatar: June_HR_public (no selector) ----------
+FIXED_AVATAR = {
+    "avatar_id": "June_HR_public",
+    "default_voice": "68dedac41a9f46a6a4271a95c733823c",
+    "pose_name": "June HR",
+    "is_public": True,
+}
+fixed_avatar_id = FIXED_AVATAR["avatar_id"]
+fixed_voice_id  = FIXED_AVATAR["default_voice"]
+fixed_pose_name = FIXED_AVATAR["pose_name"]
 
 # ------------- Session helpers -------------
 def new_session(avatar_id: str, voice_id: Optional[str] = None):
@@ -189,11 +168,12 @@ ss.setdefault("last_text", "")
 st.write("")
 c1, c2 = st.columns(2)
 with c1:
-    if st.button("Start / Restart", use_container_width=True):
+    # (3) Start-only button, minimal width (no use_container_width)
+    if st.button("Start", key="start_btn", type="primary"):
         if ss.session_id and ss.session_token:
             stop_session(ss.session_id, ss.session_token); time.sleep(0.2)
         debug("Step 1: streaming.new")
-        payload = new_session(selected["avatar_id"], selected.get("default_voice"))
+        payload = new_session(fixed_avatar_id, fixed_voice_id)
         sid, offer_sdp, rtc_config = payload["session_id"], payload["offer_sdp"], payload["rtc_config"]
         debug("Step 2: streaming.create_token")
         tok = create_session_token(sid)
@@ -203,12 +183,8 @@ with c1:
         ss.offer_sdp, ss.rtc_config = offer_sdp, rtc_config
         debug(f"[ready] session_id={sid[:8]}…")
 with c2:
-    if st.button("Stop", type="secondary", use_container_width=True):
-        if ss.session_id and ss.session_token:
-            stop_session(ss.session_id, ss.session_token)
-        ss.session_id = None; ss.session_token = None
-        ss.offer_sdp = None; ss.rtc_config = None
-        debug("[stopped] session cleared")
+    # (3) Replace old Stop button with hint text on the right
+    st.markdown("🡸🡸Click here to start")
 
 # ----------- Viewer embed (reduced height; no cropping) -----------
 viewer_path = Path(__file__).parent / "viewer.html"
@@ -219,14 +195,14 @@ else:
         html = (
             viewer_path.read_text(encoding="utf-8")
             .replace("__SESSION_TOKEN__", ss.session_token)
-            .replace("__AVATAR_NAME__", selected["label"])
+            .replace("__AVATAR_NAME__", fixed_pose_name)
             .replace("__SESSION_ID__", ss.session_id)
             .replace("__OFFER_SDP__", json.dumps(ss.offer_sdp)[1:-1])  # raw newlines
             .replace("__RTC_CONFIG__", json.dumps(ss.rtc_config or {}))
         )
         components.html(html, height=340, scrolling=False)  # ~50% height
     else:
-        st.info("Click **Start / Restart** to open a session and load the viewer.")
+        st.info("Click **Start** to open a session and load the viewer.")
 
 # =================== Voice Recorder (mic_recorder) ===================
 st.write("---")
@@ -317,3 +293,4 @@ with col2:
 
 # -------------- Debug box --------------
 st.text_area("Debug", value="\n".join(ss.debug_buf), height=220, disabled=True)
+
