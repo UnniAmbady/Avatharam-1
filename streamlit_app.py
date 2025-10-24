@@ -1,10 +1,9 @@
-# ver-12.1 (iPhone/layout tweaks + fixed avatar + Start row + static preview)
-# - Title line changed to plain text.
+# ver-12.2 (fluid mobile layout + fixed avatar + static preview)
+# - iPhone-friendly flex rows: Start+hint and Test buttons stay side-by-side.
+# - Buttons use intrinsic width (no stretching).
 # - Avatar selector removed; fixed to June_HR_public.
-# - Start button (compact) + left-aligned hint: "<-<-Click to Start".
-# - Transcript preloaded with recording instructions.
-# - Mic button labels changed to Record/Stop.
-# - Static preview frame (avatar image) shown first; replaced by live viewer on Start.
+# - Static preview shows before Start; replaced by live viewer after Start.
+# - Transcript preloaded; mic labels Record/Stop.
 
 import json
 import os
@@ -35,16 +34,29 @@ except Exception:
 # ---------------- Page ----------------
 st.set_page_config(page_title="AI Avatar Demo", layout="centered")
 
-# (1) Title replaced with plain text (avoids crop on some PCs)
+# Simple text (prevents cropping seen with st.title on some PCs)
 st.text("AI Avatar Chat")
 
+# Global CSS — includes mobile tweaks so columns don't stack on phones
 st.markdown("""
 <style>
   .block-container { padding-top:.6rem; padding-bottom:1rem; }
   iframe { border:none; border-radius:16px; }
   .rowbtn .stButton>button { height:40px; font-size:.95rem; border-radius:12px; }
   .hint { font-size:.92rem; opacity:.85; }
-  /* Static preview wrapper to mimic the live player frame */
+
+  /* ---- MOBILE FLUID GRID TWEAKS ---- */
+  /* Keep horizontal blocks inline on small screens & use intrinsic widths. */
+  @media (max-width: 640px) {
+    div[data-testid="stHorizontalBlock"] { gap: 8px !important; }
+    div[data-testid="column"] {
+      flex: 0 0 auto !important;
+      width: auto !important;
+    }
+    .stButton button { width: auto !important; }
+  }
+
+  /* Static preview wrapper to mimic live player frame */
   .preview-frame {
     background:#0f0f10;
     border-radius:18px;
@@ -58,15 +70,10 @@ st.markdown("""
   }
   .preview-img-wrap {
     display:flex; align-items:center; justify-content:center;
-    overflow:hidden; border-radius:16px;
-    background:#000;
+    overflow:hidden; border-radius:16px; background:#000;
   }
-  .preview-img {
-    width:100%; height:auto; object-fit:contain; display:block;
-  }
-  .preview-foot {
-    text-align:center; color:#cfcfcf; font-size:.85rem; margin-top:8px;
-  }
+  .preview-img { width:100%; height:auto; object-fit:contain; display:block; }
+  .preview-foot { text-align:center; color:#cfcfcf; font-size:.85rem; margin-top:8px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -125,7 +132,7 @@ def _post_bearer(url, token, payload=None):
     if r.status_code >= 400: debug(raw); r.raise_for_status()
     return r.status_code, body, raw
 
-# ---------- Fixed avatar: June_HR_public (no selector) ----------
+# ---------- Fixed avatar: June_HR_public ----------
 PREVIEW_URL = "https://files2.heygen.ai/avatar/v3/74447a27859a456c955e01f21ef18216_45620/preview_talk_1.webp"
 FIXED_AVATAR = {
     "avatar_id": "June_HR_public",
@@ -179,27 +186,29 @@ ss.setdefault("offer_sdp", None)
 ss.setdefault("rtc_config", None)
 ss.setdefault("last_text", "")
 
-# -------------- Controls row --------------
+# -------------- Controls row (fluid) --------------
 st.write("")
-c1, c2 = st.columns([1, 5], gap="small")
-with c1:
-    # (3) Start-only button, compact; no container width so it stays small on phones
-    if st.button("Start", key="start_btn", type="primary"):
-        if ss.session_id and ss.session_token:
-            stop_session(ss.session_id, ss.session_token); time.sleep(0.2)
-        debug("Step 1: streaming.new")
-        payload = new_session(fixed_avatar_id, fixed_voice_id)
-        sid, offer_sdp, rtc_config = payload["session_id"], payload["offer_sdp"], payload["rtc_config"]
-        debug("Step 2: streaming.create_token")
-        tok = create_session_token(sid)
-        debug("Step 3: sleep 1.0s before viewer")
-        time.sleep(1.0)
-        ss.session_id, ss.session_token = sid, tok
-        ss.offer_sdp, ss.rtc_config = offer_sdp, rtc_config
-        debug(f"[ready] session_id={sid[:8]}…")
-with c2:
-    # iPhone-friendly, left-aligned short hint (ASCII arrows)
-    st.markdown('<div class="hint">&lt;-&lt;-Click to Start</div>', unsafe_allow_html=True)
+row = st.container()
+with row:
+    c1, c2 = st.columns([1, 5], gap="small")
+    with c1:
+        # Compact Start button; intrinsic width even on phones
+        if st.button("Start", key="start_btn", type="primary"):
+            if ss.session_id and ss.session_token:
+                stop_session(ss.session_id, ss.session_token); time.sleep(0.2)
+            debug("Step 1: streaming.new")
+            payload = new_session(fixed_avatar_id, fixed_voice_id)
+            sid, offer_sdp, rtc_config = payload["session_id"], payload["offer_sdp"], payload["rtc_config"]
+            debug("Step 2: streaming.create_token")
+            tok = create_session_token(sid)
+            debug("Step 3: sleep 1.0s before viewer")
+            time.sleep(1.0)
+            ss.session_id, ss.session_token = sid, tok
+            ss.offer_sdp, ss.rtc_config = offer_sdp, rtc_config
+            debug(f"[ready] session_id={sid[:8]}…")
+    with c2:
+        # Left-aligned small hint (ASCII arrows)
+        st.markdown('<div class="hint">&lt;-&lt;-Click to Start</div>', unsafe_allow_html=True)
 
 # ----------- Viewer / Preview area -----------
 viewer_path = Path(__file__).parent / "viewer.html"
@@ -242,10 +251,9 @@ wav_bytes: Optional[bytes] = None
 if not _HAS_MIC:
     st.warning("`streamlit-mic-recorder` is not installed.")
 else:
-    # Use a STABLE key so state isn’t lost on rerun.
     audio = mic_recorder(
         start_prompt="Record",   # renamed
-        stop_prompt="Stop",      # unchanged
+        stop_prompt="Stop",
         just_once=False,
         use_container_width=False,
         key="mic_recorder",
@@ -284,31 +292,33 @@ if wav_bytes:
             try: os.remove(tmp_path)
             except Exception: pass
     if not text:
-        # Fallback stub if Whisper not available
         text = "Thanks! (audio captured)"
 
     ss.last_text = text
     debug(f"[voice→text] {text if text else '(empty)'}")
 
 # ---- Transcript box (editable) with preload instructions
-DEFAULT_TRANSCRIPT_HINT = 'To record your message press "Record" and start speaking. When sentence is completed press "Stop".'
-if not ss.get("last_text"):
+DEFAULT_TRANSCRIPT_HINT = (
+    'Hello, ok to record the message press "Record" and start speaking. '
+    'When the sentence is completed press the "Stop" button.'
+)
+if not (ss.get("last_text") or "").strip():
     ss.last_text = DEFAULT_TRANSCRIPT_HINT
 
 st.subheader("Transcript")
 ss.last_text = st.text_area(" ", value=ss.last_text, height=140, label_visibility="collapsed")
 
-# ============ Actions ============
+# ============ Actions (fluid two small buttons) ============
 st.write("")
-col1, col2 = st.columns(2, gap="small")
-with col1:
-    if st.button("Test-1", use_container_width=True):
+act1, act2 = st.columns([1, 1], gap="small")
+with act1:
+    if st.button("Test-1"):  # intrinsic width
         if not (ss.session_id and ss.session_token and ss.offer_sdp):
             st.warning("Start a session first.")
         else:
             send_echo(ss.session_id, ss.session_token, "Hello. Welcome to the test demonstration.")
-with col2:
-    if st.button("Test-2 (Send transcript)", use_container_width=True):
+with act2:
+    if st.button("Test-2 (Send transcript)"):  # intrinsic width
         if not (ss.session_id and ss.session_token and ss.offer_sdp):
             st.warning("Start a session first.")
         elif not (ss.last_text or "").strip():
