@@ -1,10 +1,10 @@
-# ver-12 (patched for fixed avatar + Start row)
-# HeyGen avatar + mic_recorder + (optional) faster-whisper
-# Fixes:
-# - Viewer video no longer cropped (paired viewer.html uses object-fit: contain).
-# - Mic recorder uses a *stable key* and shows audio player & transcript reliably.
-# - Clear instruction label & robust diagnostics.
-# - Test-2 sends current transcript to avatar.
+# ver-12.1 (iPhone/layout tweaks + fixed avatar + Start row + static preview)
+# - Title line changed to plain text.
+# - Avatar selector removed; fixed to June_HR_public.
+# - Start button (compact) + left-aligned hint: "<-<-Click to Start".
+# - Transcript preloaded with recording instructions.
+# - Mic button labels changed to Record/Stop.
+# - Static preview frame (avatar image) shown first; replaced by live viewer on Start.
 
 import json
 import os
@@ -13,14 +13,13 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
 # --- Optional STT backend ---
 try:
-    from faster_whisper import WhisperModel  # local inference
+    from faster_whisper import WhisperModel
     _HAS_FWHISPER = True
 except Exception:
     WhisperModel = None  # type: ignore
@@ -35,15 +34,39 @@ except Exception:
 
 # ---------------- Page ----------------
 st.set_page_config(page_title="AI Avatar Demo", layout="centered")
-# (1) Title replaced with plain text (to avoid cut-off)
-st.text("\n\nAI Avatar Chat")
+
+# (1) Title replaced with plain text (avoids crop on some PCs)
+st.text("AI Avatar Chat")
 
 st.markdown("""
 <style>
   .block-container { padding-top:.6rem; padding-bottom:1rem; }
   iframe { border:none; border-radius:16px; }
   .rowbtn .stButton>button { height:40px; font-size:.95rem; border-radius:12px; }
-  .hint { font-size:.9rem; opacity:.75; }
+  .hint { font-size:.92rem; opacity:.85; }
+  /* Static preview wrapper to mimic the live player frame */
+  .preview-frame {
+    background:#0f0f10;
+    border-radius:18px;
+    padding:12px 12px 24px 12px;
+  }
+  .preview-title {
+    text-align:center;
+    color:#e6e6e6;
+    font-weight:600;
+    margin:6px 0 10px 0;
+  }
+  .preview-img-wrap {
+    display:flex; align-items:center; justify-content:center;
+    overflow:hidden; border-radius:16px;
+    background:#000;
+  }
+  .preview-img {
+    width:100%; height:auto; object-fit:contain; display:block;
+  }
+  .preview-foot {
+    text-align:center; color:#cfcfcf; font-size:.85rem; margin-top:8px;
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -66,7 +89,6 @@ if not HEYGEN_API_KEY:
 
 # --------------- Endpoints --------------
 BASE = "https://api.heygen.com/v1"
-API_LIST_AVATARS = f"{BASE}/streaming/avatar.list"     # GET (x-api-key)
 API_STREAM_NEW   = f"{BASE}/streaming.new"             # POST (x-api-key)
 API_CREATE_TOKEN = f"{BASE}/streaming.create_token"    # POST (x-api-key)
 API_STREAM_TASK  = f"{BASE}/streaming.task"            # POST (Bearer)
@@ -85,15 +107,6 @@ def debug(msg: str):
         ss.debug_buf[:] = ss.debug_buf[-1000:]
 
 # ------------- HTTP helpers --------------
-def _get(url, params=None):
-    r = requests.get(url, headers=HEADERS_XAPI, params=params, timeout=45)
-    raw = r.text
-    try: body = r.json()
-    except Exception: body = {"_raw": raw}
-    debug(f"[GET] {url} -> {r.status_code}")
-    if r.status_code >= 400: debug(raw); r.raise_for_status()
-    return r.status_code, body, raw
-
 def _post_xapi(url, payload=None):
     r = requests.post(url, headers=HEADERS_XAPI, data=json.dumps(payload or {}), timeout=60)
     raw = r.text
@@ -112,12 +125,14 @@ def _post_bearer(url, token, payload=None):
     if r.status_code >= 400: debug(raw); r.raise_for_status()
     return r.status_code, body, raw
 
-# ---------- (2) Fixed avatar: June_HR_public (no selector) ----------
+# ---------- Fixed avatar: June_HR_public (no selector) ----------
+PREVIEW_URL = "https://files2.heygen.ai/avatar/v3/74447a27859a456c955e01f21ef18216_45620/preview_talk_1.webp"
 FIXED_AVATAR = {
     "avatar_id": "June_HR_public",
     "default_voice": "68dedac41a9f46a6a4271a95c733823c",
     "pose_name": "June HR",
     "is_public": True,
+    "normal_preview": PREVIEW_URL,
 }
 fixed_avatar_id = FIXED_AVATAR["avatar_id"]
 fixed_voice_id  = FIXED_AVATAR["default_voice"]
@@ -166,9 +181,9 @@ ss.setdefault("last_text", "")
 
 # -------------- Controls row --------------
 st.write("")
-c1, c2 = st.columns(2)
+c1, c2 = st.columns([1, 5], gap="small")
 with c1:
-    # (3) Start-only button, minimal width (no use_container_width)
+    # (3) Start-only button, compact; no container width so it stays small on phones
     if st.button("Start", key="start_btn", type="primary"):
         if ss.session_id and ss.session_token:
             stop_session(ss.session_id, ss.session_token); time.sleep(0.2)
@@ -183,31 +198,45 @@ with c1:
         ss.offer_sdp, ss.rtc_config = offer_sdp, rtc_config
         debug(f"[ready] session_id={sid[:8]}…")
 with c2:
-    # (3) Replace old Stop button with hint text on the right
-    st.markdown("🡸🡸Click here to start")
+    # iPhone-friendly, left-aligned short hint (ASCII arrows)
+    st.markdown('<div class="hint">&lt;-&lt;-Click to Start</div>', unsafe_allow_html=True)
 
-# ----------- Viewer embed (reduced height; no cropping) -----------
+# ----------- Viewer / Preview area -----------
 viewer_path = Path(__file__).parent / "viewer.html"
-if not viewer_path.exists():
-    st.warning("viewer.html not found next to streamlit_app.py.")
+viewer_area = st.container()
+
+if ss.session_id and ss.session_token and ss.offer_sdp and viewer_path.exists():
+    # Render LIVE viewer (replaces the static preview)
+    html = (
+        viewer_path.read_text(encoding="utf-8")
+        .replace("__SESSION_TOKEN__", ss.session_token)
+        .replace("__AVATAR_NAME__", fixed_pose_name)
+        .replace("__SESSION_ID__", ss.session_id)
+        .replace("__OFFER_SDP__", json.dumps(ss.offer_sdp)[1:-1])  # raw newlines
+        .replace("__RTC_CONFIG__", json.dumps(ss.rtc_config or {}))
+    )
+    with viewer_area:
+        components.html(html, height=340, scrolling=False)
 else:
-    if ss.session_id and ss.session_token and ss.offer_sdp:
-        html = (
-            viewer_path.read_text(encoding="utf-8")
-            .replace("__SESSION_TOKEN__", ss.session_token)
-            .replace("__AVATAR_NAME__", fixed_pose_name)
-            .replace("__SESSION_ID__", ss.session_id)
-            .replace("__OFFER_SDP__", json.dumps(ss.offer_sdp)[1:-1])  # raw newlines
-            .replace("__RTC_CONFIG__", json.dumps(ss.rtc_config or {}))
+    # Static preview frame (neat placeholder before Start)
+    with viewer_area:
+        st.markdown(
+            f"""
+<div class="preview-frame">
+  <div class="preview-title">Avatar: {fixed_pose_name}</div>
+  <div class="preview-img-wrap">
+    <img class="preview-img" src="{PREVIEW_URL}" alt="Avatar preview">
+  </div>
+  <div class="preview-foot">Click Start to open a session and load the viewer.</div>
+</div>
+""",
+            unsafe_allow_html=True,
         )
-        components.html(html, height=340, scrolling=False)  # ~50% height
-    else:
-        st.info("Click **Start** to open a session and load the viewer.")
 
 # =================== Voice Recorder (mic_recorder) ===================
 st.write("---")
 st.subheader("Voice")
-st.caption("Click **Start** to record and **Stop** when done. Transcription runs after stopping.")
+st.caption('Click **Record** to capture audio and **Stop** when done. Transcription runs after stopping.')
 
 wav_bytes: Optional[bytes] = None
 if not _HAS_MIC:
@@ -215,8 +244,8 @@ if not _HAS_MIC:
 else:
     # Use a STABLE key so state isn’t lost on rerun.
     audio = mic_recorder(
-        start_prompt="Start",
-        stop_prompt="Stop",
+        start_prompt="Record",   # renamed
+        stop_prompt="Stop",      # unchanged
         just_once=False,
         use_container_width=False,
         key="mic_recorder",
@@ -226,7 +255,6 @@ else:
     if audio is None:
         debug("[mic] waiting for recording…")
     else:
-        # mic_recorder returns dict with .bytes after Stop
         if isinstance(audio, dict) and "bytes" in audio:
             wav_bytes = audio["bytes"]
             debug(f"[mic] received {len(wav_bytes)} bytes")
@@ -256,20 +284,17 @@ if wav_bytes:
             try: os.remove(tmp_path)
             except Exception: pass
     if not text:
-        # Fallback stub text (lets the pipeline work even without Whisper)
-        import wave, io as _io
-        try:
-            with wave.open(_io.BytesIO(wav_bytes), "rb") as w:
-                frames = w.getnframes(); rate = w.getframerate()
-                secs = frames / float(rate or 16000)
-            text = f"I heard you for about {secs:.1f} seconds."
-        except Exception:
-            text = "Thanks! (audio captured)"
+        # Fallback stub if Whisper not available
+        text = "Thanks! (audio captured)"
 
     ss.last_text = text
     debug(f"[voice→text] {text if text else '(empty)'}")
 
-# ---- Transcript box (editable)
+# ---- Transcript box (editable) with preload instructions
+DEFAULT_TRANSCRIPT_HINT = 'To record your message press "Record" and start speaking. When sentence is completed press "Stop".'
+if not ss.get("last_text"):
+    ss.last_text = DEFAULT_TRANSCRIPT_HINT
+
 st.subheader("Transcript")
 ss.last_text = st.text_area(" ", value=ss.last_text, height=140, label_visibility="collapsed")
 
@@ -293,4 +318,3 @@ with col2:
 
 # -------------- Debug box --------------
 st.text_area("Debug", value="\n".join(ss.debug_buf), height=220, disabled=True)
-
