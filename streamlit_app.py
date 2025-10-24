@@ -190,7 +190,8 @@ ss.setdefault("last_text", "")
 st.write("")
 row = st.container()
 with row:
-    c1, c2 = st.columns([1, 5], gap="small")
+    #c1, c2 = st.columns([1, 5], gap="small")
+    c1, c2 = st.columns(2, gap="small")
     with c1:
         # Compact Start button; intrinsic width even on phones
         if st.button("Start", key="start_btn", type="primary"):
